@@ -222,6 +222,28 @@ const FUNDS_BUFFER_INR: f64 = 500.0;
 const NO_ENTRY_HOUR: u32 = 15;
 const NO_ENTRY_MINUTE: u32 = 29;
 
+/// Attempts made against `get_limits` in a single entry pre-flight before
+/// giving up on *this* tick. A transient blip usually clears within a retry or
+/// two; if it doesn't, the position stays `WaitingForEntry` and the whole
+/// pre-flight is retried on a later tick — nothing is bought and nothing is
+/// dropped.
+const LIMITS_PREFLIGHT_ATTEMPTS: u32 = 3;
+const LIMITS_PREFLIGHT_RETRY_GAP: Duration = Duration::from_millis(400);
+
+/// Minimum spacing between entry pre-flight attempts for one position. Once the
+/// trigger has fired the engine wants in promptly, but not at the 50 ms tick
+/// rate — this keeps a broker outage from spamming the log with one
+/// "could not verify funds" line every tick.
+const ENTRY_RETRY_THROTTLE: Duration = Duration::from_secs(5);
+
+/// How long the reconciler keeps hunting the order book for an entry whose send
+/// outcome is unknown (`entry_send_uncertain`) before concluding — only ever on
+/// a tick where the order-book read itself succeeded — that the order never
+/// reached the broker. Comfortably longer than the time Kotak takes to surface
+/// a just-placed order in the book, short enough that a genuinely-lost send is
+/// retried well before it matters.
+const UNCERTAIN_ENTRY_GRACE: Duration = Duration::from_secs(20);
+
 /// True at/after 15:29 IST, for the remainder of the day.
 fn is_entry_cutoff_passed() -> bool {
     use chrono::Timelike;
@@ -251,6 +273,14 @@ fn stale_entry_reason(pos: &MonitoredPosition, entry_cutoff: bool) -> Option<&'s
     let same_day = chrono::NaiveDateTime::parse_from_str(&pos.created_at, "%Y-%m-%d %H:%M:%S")
         .is_ok_and(|dt| dt.date() == shared_domain::today_ist());
     (!same_day).then_some("STALE_CARRYOVER")
+}
+
+/// Whole seconds elapsed since an IST `%Y-%m-%d %H:%M:%S` timestamp, or `None`
+/// when the string is missing or unparseable. Negative values (a clock that
+/// went backwards) are clamped to 0.
+fn secs_since_ist(ts: &Option<String>) -> Option<i64> {
+    let parsed = chrono::NaiveDateTime::parse_from_str(ts.as_ref()?, "%Y-%m-%d %H:%M:%S").ok()?;
+    Some((shared_domain::now_ist().naive_local() - parsed).num_seconds().max(0))
 }
 
 /// Round `price` DOWN to a whole multiple of `tick`.
@@ -321,20 +351,24 @@ fn build_market_order(
 
 type KotakHandle = Arc<tokio::sync::Mutex<Option<KotakClient>>>;
 
-async fn kotak_place(kotak: &KotakHandle, order: &shared_domain::OrderRequest) -> Result<String, String> {
+/// Places an order and returns the broker error unflattened, so the entry path
+/// can tell a hard rejection (`OrderRejected`) apart from a send that never got
+/// a verdict (`is_ambiguous`) or a dead session (`is_session_expired`).
+async fn kotak_place(
+    kotak: &KotakHandle,
+    order: &shared_domain::OrderRequest,
+) -> Result<String, kotak_client::KotakError> {
     let guard = kotak.lock().await;
-    let client = guard.as_ref().ok_or_else(|| "no Kotak session".to_string())?;
-    client
-        .place_live_order(order)
-        .await
-        .map(|e| e.order_id)
-        .map_err(|e| e.to_string())
+    let client = guard.as_ref().ok_or(kotak_client::KotakError::NotAuthenticated)?;
+    client.place_live_order(order).await.map(|e| e.order_id)
 }
 
-async fn kotak_limits(kotak: &KotakHandle) -> Result<kotak_client::KotakLimits, String> {
+async fn kotak_limits(
+    kotak: &KotakHandle,
+) -> Result<kotak_client::KotakLimits, kotak_client::KotakError> {
     let guard = kotak.lock().await;
-    let client = guard.as_ref().ok_or_else(|| "no Kotak session".to_string())?;
-    client.get_limits().await.map_err(|e| e.to_string())
+    let client = guard.as_ref().ok_or(kotak_client::KotakError::NotAuthenticated)?;
+    client.get_limits().await
 }
 
 async fn kotak_cancel(kotak: &KotakHandle, order_no: &str, trading_symbol: &str) -> Result<(), String> {
@@ -468,6 +502,13 @@ struct LiveLeg {
     at_target1: bool,
     entry_order_id: Option<String>,
     entry_cancel_sent: bool,
+    /// An entry order was sent for this position but never acknowledged — the
+    /// reconciler must find it in the book (or prove it isn't there). Only ever
+    /// set while `entry_order_id` is `None`.
+    entry_send_uncertain: bool,
+    entry_uncertain_qty: Option<i32>,
+    /// Whole seconds since that send attempt, for the grace-window timeout.
+    entry_attempt_secs: Option<i64>,
     sl_order_id: Option<String>,
     pending_exit_order_id: Option<String>,
     pending_exit_qty: i32,
@@ -486,11 +527,12 @@ async fn reconcile_live_orders(
     log_tx: &broadcast::Sender<String>,
     brokerage: f64,
 ) -> bool {
-    let legs: Vec<LiveLeg> = {
+    let (legs, claimed_entry_ids): (Vec<LiveLeg>, Vec<String>) = {
         let g = positions.read().await;
-        g.iter()
+        let legs = g.iter()
             .filter(|p| {
                 p.entry_order_id.is_some()
+                    || p.entry_send_uncertain
                     || p.sl_order_id.is_some()
                     || p.pending_exit_order_id.is_some()
             })
@@ -510,12 +552,22 @@ async fn reconcile_live_orders(
                 at_target1: matches!(p.state, TradeState::Target1Hit),
                 entry_order_id: p.entry_order_id.clone(),
                 entry_cancel_sent: p.entry_cancel_sent,
+                entry_send_uncertain: p.entry_send_uncertain && p.entry_order_id.is_none(),
+                entry_uncertain_qty: p.entry_uncertain_qty,
+                entry_attempt_secs: secs_since_ist(&p.entry_attempt_at),
                 sl_order_id: p.sl_order_id.clone(),
                 pending_exit_order_id: p.pending_exit_order_id.clone(),
                 pending_exit_qty: p.pending_exit_qty,
                 pending_exit_reason: p.pending_exit_reason.clone(),
             })
-            .collect()
+            .collect();
+        // Every entry order number the engine already owns — the uncertain-entry
+        // hunt below must not adopt an order that belongs to another position.
+        let claimed = g.iter()
+            .filter_map(|p| p.entry_order_id.clone())
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        (legs, claimed)
     };
     if legs.is_empty() {
         return false;
@@ -541,6 +593,77 @@ async fn reconcile_live_orders(
     let mut mutated = false;
 
     for leg in &legs {
+        // ── Unconfirmed entry send ──────────────────────────────────── //
+        // An entry order went out but its broker response was lost, so it may
+        // or may not be live. Find the matching order and adopt it (the entry
+        // leg below then settles it like any other), or — only once the grace
+        // window has passed on a poll where the book actually read cleanly —
+        // conclude nothing was placed and hand the position back to decide_live.
+        if leg.entry_send_uncertain {
+            let want_qty = leg.entry_uncertain_qty.unwrap_or(0);
+            let sym = leg.trading_symbol.trim();
+            let matches: Vec<&kotak_client::KotakOrder> = if sym.is_empty() {
+                Vec::new()
+            } else {
+                book.iter()
+                    .filter(|o| {
+                        !o.is_sell()
+                            && o.trading_symbol.trim() == sym
+                            && !claimed_entry_ids.iter().any(|c| c.trim() == o.order_no.trim())
+                            && (want_qty <= 0 || o.ordered_qty() == want_qty)
+                    })
+                    .collect()
+            };
+
+            match matches.as_slice() {
+                [ord] => {
+                    let adopted = ord.order_no.trim().to_string();
+                    let status = ord.status.trim().to_string();
+                    with_position(positions, &leg.pos_id, |p| {
+                        p.entry_order_id = Some(adopted.clone());
+                        p.entry_send_uncertain = false;
+                        p.entry_uncertain_qty = None;
+                        p.entry_cancel_sent = false;
+                    }).await;
+                    loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                        "found order {adopted} ({status}) for {sym} in the book and adopted it as this position's entry — its placement had been unconfirmed. It settles on the next poll; verify against your broker app"
+                    )).await;
+                    mutated = true;
+                }
+                [] => {
+                    let waited = leg.entry_attempt_secs.unwrap_or(0);
+                    if waited >= UNCERTAIN_ENTRY_GRACE.as_secs() as i64 {
+                        with_position(positions, &leg.pos_id, |p| {
+                            p.entry_send_uncertain = false;
+                            p.entry_uncertain_qty = None;
+                        }).await;
+                        live_info(db_tx, log_tx, json!({
+                            "event": "ENTRY_SEND_UNCONFIRMED_CLEARED",
+                            "instrument": leg.instrument,
+                            "note": format!("no matching order in the book {waited}s after an unconfirmed entry send — treating it as never placed"),
+                            "mode": "LIVE",
+                        })).await;
+                        mutated = true;
+                    }
+                    // else: still inside the grace window — Kotak may not have
+                    // surfaced the order yet. Wait for the next poll.
+                }
+                many => {
+                    let n = many.len();
+                    with_position(positions, &leg.pos_id, |p| {
+                        p.entry_send_uncertain = false;
+                        p.entry_uncertain_qty = None;
+                        p.live_halt = Some("unconfirmed entry send matched multiple broker orders".to_string());
+                    }).await;
+                    loud_error(db_tx, log_tx, &leg.instrument, &format!(
+                        "an unconfirmed entry send for {sym} matches {n} buy orders in the book — cannot tell which is ours, so this position is halted; resolve it at the broker terminal"
+                    )).await;
+                    mutated = true;
+                }
+            }
+            continue;
+        }
+
         // ── Entry leg ────────────────────────────────────────────────── //
         if let Some(oid) = leg.entry_order_id.clone() {
             if let Some(ord) = book.iter().find(|o| o.order_no.trim() == oid.trim()) {
@@ -750,6 +873,19 @@ async fn reconcile_on_startup(
     brokerage: f64,
 ) -> bool {
     tracing::info!("LIVE startup reconciliation starting");
+
+    // 0. Restart the grace clock on any entry whose send was never confirmed.
+    //    Its `entry_attempt_at` is from before the restart, so without this the
+    //    reconciler could decide "no matching order, never placed" on the very
+    //    first order-book read — before Kotak has had a chance to surface a fill
+    //    that landed while we were down — and then let decide_live buy again.
+    {
+        let now = shared_domain::current_ist_timestamp_string();
+        let mut g = positions.write().await;
+        for p in g.iter_mut().filter(|p| p.entry_send_uncertain) {
+            p.entry_attempt_at = Some(now.clone());
+        }
+    }
 
     // 1. Settle whatever we were already tracking first, so a fill that landed
     //    while we were down is recorded as a real trade rather than inferred
@@ -1428,6 +1564,10 @@ async fn adopt_manual(
         pending_exit_reason: None,
         entry_cancel_sent: false,
         exit_attempts: 0,
+        entry_attempts: 0,
+        entry_attempt_at: None,
+        entry_send_uncertain: false,
+        entry_uncertain_qty: None,
         live_halt: None,
     };
 
@@ -1509,6 +1649,17 @@ fn decide_live(
         TradeState::Closed => None,
 
         TradeState::WaitingForEntry => {
+            // An entry order was sent but its outcome was never confirmed. The
+            // reconciler now owns this position: it is hunting the order book
+            // for the fill to adopt, or will clear the flag once it is certain
+            // nothing was placed. Send nothing else, and don't let a forced
+            // exit / staleness rule (or the kill switch) close it in the
+            // meantime — if the order did fill, closing here would drop a real
+            // holding. The grace window is seconds, well inside any cutoff; once
+            // it resolves to Active the kill switch squares it off there.
+            if pos.entry_send_uncertain {
+                return None;
+            }
             if cfg.kill_switch_active {
                 return Some(LiveAction::AbandonEntry {
                     reason: "KILL_SWITCH_ACTIVE".to_string(),
@@ -1524,6 +1675,17 @@ fn decide_live(
             if pos.entry_order_id.is_some() {
                 // In flight — the order book decides what happened.
                 return None;
+            }
+            // Every send of this entry failed before the broker gave a verdict
+            // and every follow-up hunt came up empty. Stop trying.
+            if pos.entry_attempts >= shared_domain::MAX_ENTRY_ATTEMPTS {
+                return Some(LiveAction::AbandonEntry {
+                    reason: format!(
+                        "entry order could not be sent after {} attempts (broker unreachable) — signal dropped",
+                        shared_domain::MAX_ENTRY_ATTEMPTS
+                    ),
+                    loud: true,
+                });
             }
             let ltp = ltp?;
             let triggered = match pos.signal.entry_condition.to_uppercase().as_str() {
@@ -1549,6 +1711,14 @@ fn decide_live(
                     reason: format!("invalid quantity {qty} for lot size {lot}"),
                     loud: false,
                 });
+            }
+            // Space out entry attempts. A pre-flight that just failed (funds
+            // unverifiable, ambiguous send) gets time to recover instead of
+            // being retried on the very next 50 ms tick.
+            if let Some(elapsed) = secs_since_ist(&pos.entry_attempt_at) {
+                if elapsed < ENTRY_RETRY_THROTTLE.as_secs() as i64 {
+                    return None;
+                }
             }
             Some(LiveAction::PlaceEntry { qty, ltp })
         }
@@ -1820,30 +1990,50 @@ async fn exec_live_action(
 
     match &pending.action {
         LiveAction::PlaceEntry { qty, ltp } => {
+            // Stamp the attempt time first, so decide_live's throttle spaces
+            // out the next pre-flight even if this one bails out below.
+            with_position(positions, &pending.pos_id, |p| {
+                p.entry_attempt_at = Some(shared_domain::current_ist_timestamp_string());
+            }).await;
+
             // Pre-flight funds check. We must be able to pay for the order and
             // still have the buffer left over — the account is never run to zero.
             let order_value = *qty as f64 * *ltp;
             let required = order_value + FUNDS_BUFFER_INR;
-            match kotak_limits(kotak).await {
-                Ok(limits) => {
-                    if limits.net < required {
-                        loud_error(db_tx, log_tx, &ctx.instrument, &format!(
-                            "not enough funds for {qty} @ ~₹{ltp:.2}: needs ₹{required:.2} (₹{order_value:.2} order + ₹{FUNDS_BUFFER_INR:.0} buffer) but only ₹{:.2} is available — signal dropped",
-                            limits.net
-                        )).await;
-                        with_position(positions, &pending.pos_id, |p| p.state = TradeState::Closed).await;
-                        return true;
+            let mut limits_err = None;
+            for attempt in 1..=LIMITS_PREFLIGHT_ATTEMPTS {
+                match kotak_limits(kotak).await {
+                    Ok(limits) => {
+                        limits_err = None;
+                        if limits.net < required {
+                            loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                                "not enough funds for {qty} @ ~₹{ltp:.2}: needs ₹{required:.2} (₹{order_value:.2} order + ₹{FUNDS_BUFFER_INR:.0} buffer) but only ₹{:.2} is available — signal dropped",
+                                limits.net
+                            )).await;
+                            with_position(positions, &pending.pos_id, |p| p.state = TradeState::Closed).await;
+                            return true;
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        limits_err = Some(e);
+                        if attempt < LIMITS_PREFLIGHT_ATTEMPTS {
+                            tokio::time::sleep(LIMITS_PREFLIGHT_RETRY_GAP).await;
+                        }
                     }
                 }
-                Err(e) => {
-                    // Unverifiable funds are treated as insufficient funds. Missing
-                    // a signal is recoverable; buying blind is not.
-                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
-                        "could not read account limits ({e}) — entry not placed because funds cannot be verified, signal dropped"
-                    )).await;
-                    with_position(positions, &pending.pos_id, |p| p.state = TradeState::Closed).await;
-                    return true;
-                }
+            }
+            if let Some(e) = limits_err {
+                // Funds could not be verified. Nothing was sent, so nothing is
+                // at the broker — keep the position WaitingForEntry and let a
+                // later tick retry the whole pre-flight (decide_live throttles
+                // it to one attempt per poll). A dead session is surfaced so
+                // the server's watchdog re-logs-in; a transient blip just waits.
+                let cause = if e.is_session_expired() { "Kotak session expired" } else { "Kotak unreachable" };
+                loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                    "could not verify funds before entry ({e}) — {cause}; holding the signal and retrying, nothing bought"
+                )).await;
+                return true;
             }
 
             let order = build_market_order(
@@ -1857,6 +2047,9 @@ async fn exec_live_action(
                     with_position(positions, &pending.pos_id, |p| {
                         p.entry_order_id = Some(order_id.clone());
                         p.entry_cancel_sent = false;
+                        p.entry_send_uncertain = false;
+                        p.entry_uncertain_qty = None;
+                        p.entry_attempts += 1;
                     }).await;
                     tracing::info!(instrument = %ctx.instrument, %order_id, qty, "LIVE entry market buy placed");
                     live_info(db_tx, log_tx, json!({
@@ -1867,7 +2060,35 @@ async fn exec_live_action(
                         "mode": "LIVE",
                     })).await;
                 }
+                Err(e) if e.is_session_expired() => {
+                    // HTTP 401/403 — the gateway rejected the request before it
+                    // was processed, so the order was provably not placed. Not
+                    // counted as a real attempt: leave the position waiting so
+                    // it enters once the watchdog restores the session (the
+                    // trigger / past-target-1 guards are re-checked each tick).
+                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                        "entry order not sent — Kotak session expired ({e}); holding the signal until the session is restored, nothing bought"
+                    )).await;
+                }
+                Err(e) if e.is_ambiguous() => {
+                    // Connect failure / timeout / unparseable reply — the order
+                    // MAY have reached Kotak and filled. Never assume rejection:
+                    // mark the position uncertain so the reconciler hunts the
+                    // order book for the matching BUY and adopts it (placing the
+                    // protective stop), or clears the flag once it is sure
+                    // nothing landed.
+                    with_position(positions, &pending.pos_id, |p| {
+                        p.entry_send_uncertain = true;
+                        p.entry_uncertain_qty = Some(*qty);
+                        p.entry_attempts += 1;
+                    }).await;
+                    loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                        "entry order send got no broker verdict ({e}) — it MAY be live at Kotak. Reconciling against the order book before anything else; check your broker app now"
+                    )).await;
+                }
                 Err(e) => {
+                    // A real rejection from the exchange / RMS.
+                    with_position(positions, &pending.pos_id, |p| p.entry_attempts += 1).await;
                     loud_error(db_tx, log_tx, &ctx.instrument, &format!(
                         "entry market buy for {qty} was rejected: {e} — signal dropped, it will not be retried"
                     )).await;
@@ -2553,6 +2774,10 @@ pub async fn start_position_monitor(
                                     pending_exit_reason: None,
                                     entry_cancel_sent: false,
                                     exit_attempts: 0,
+                                    entry_attempts: 0,
+                                    entry_attempt_at: None,
+                                    entry_send_uncertain: false,
+                                    entry_uncertain_qty: None,
                                     live_halt: None,
                                 });
                                 let snapshot = pos_guard.clone();
@@ -2947,6 +3172,10 @@ mod tests {
             pending_exit_reason: None,
             entry_cancel_sent: false,
             exit_attempts: 0,
+            entry_attempts: 0,
+            entry_attempt_at: None,
+            entry_send_uncertain: false,
+            entry_uncertain_qty: None,
             live_halt: None,
         }
     }
@@ -3042,6 +3271,94 @@ mod tests {
         // A signal with no target can never trip the guard.
         sig.targets.clear();
         assert_eq!(entry_past_target1(&sig, 9_999.0), None);
+    }
+
+    /// A `WaitingForEntry` LIVE position wired for `decide_live`: resolved to a
+    /// 75-lot NIFTY CE, entry 120 ABOVE, with the price seeded at 121 so the
+    /// trigger fires.
+    fn live_waiting_position(ltp_map: &Arc<DashMap<String, f64>>) -> MonitoredPosition {
+        use shared_domain::{AmoFlag, ExchangeSegment, OrderRequest, OrderType, ProductCode, TransactionType, Validity};
+        let mut pos = position_created_at(&shared_domain::current_ist_timestamp_string());
+        pos.ws_scrip_key = Some("nse_fo|999".to_string());
+        pos.resolved_order = Some(OrderRequest {
+            after_market_order: AmoFlag::No,
+            disclosed_quantity: "0".to_string(),
+            exchange_segment: ExchangeSegment::NseFo,
+            market_protection: "0".to_string(),
+            product_code: ProductCode::Nrml,
+            portfolio_flag: "N".to_string(),
+            price: "0".to_string(),
+            order_type: OrderType::Market,
+            quantity: "75".to_string(),
+            validity: Validity::Day,
+            trigger_price: "0".to_string(),
+            trading_symbol: "NIFTY25000CE".to_string(),
+            transaction_type: TransactionType::Buy,
+        });
+        ltp_map.insert("nse_fo|999".to_string(), 121.0);
+        pos
+    }
+
+    #[test]
+    fn decide_live_sends_entry_when_triggered_and_unthrottled() {
+        let ltp = Arc::new(DashMap::new());
+        let pos = live_waiting_position(&ltp);
+        assert!(matches!(
+            decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true),
+            Some(LiveAction::PlaceEntry { .. })
+        ));
+    }
+
+    #[test]
+    fn decide_live_holds_an_unconfirmed_entry_send_for_the_reconciler() {
+        // A send with no broker verdict must not be re-sent, and must not be
+        // closed by the staleness / forced-exit rules while the reconciler is
+        // still hunting the order book for it.
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = live_waiting_position(&ltp);
+        pos.entry_send_uncertain = true;
+        pos.force_exit = Some("USER_EXIT".to_string());
+        assert!(decide_live(&pos, &ltp, &cfg_with_lots(1, 3), true, true).is_none());
+    }
+
+    #[test]
+    fn decide_live_throttles_entry_retries() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = live_waiting_position(&ltp);
+        // An attempt a moment ago blocks another on this tick.
+        pos.entry_attempt_at = Some(shared_domain::current_ist_timestamp_string());
+        assert!(decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true).is_none());
+        // One from well before the throttle window does not.
+        let stale = (shared_domain::now_ist() - chrono::Duration::seconds(10))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        pos.entry_attempt_at = Some(stale);
+        assert!(matches!(
+            decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true),
+            Some(LiveAction::PlaceEntry { .. })
+        ));
+    }
+
+    #[test]
+    fn decide_live_abandons_an_entry_that_could_never_be_sent() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = live_waiting_position(&ltp);
+        pos.entry_attempts = shared_domain::MAX_ENTRY_ATTEMPTS;
+        match decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true) {
+            Some(LiveAction::AbandonEntry { loud, .. }) => assert!(loud),
+            other => panic!("expected a loud AbandonEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secs_since_ist_handles_missing_and_past_timestamps() {
+        assert_eq!(secs_since_ist(&None), None);
+        assert_eq!(secs_since_ist(&Some("not a date".to_string())), None);
+        let ten_ago = (shared_domain::now_ist() - chrono::Duration::seconds(10))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let s = secs_since_ist(&Some(ten_ago)).unwrap();
+        assert!((8..=12).contains(&s), "expected ~10s, got {s}");
     }
 
     /// An Active position from the shared helper: entry/avg 120, targets

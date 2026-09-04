@@ -8,6 +8,7 @@ mod db;
 mod routes;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::{routing::{get, post}, Router};
 use chrono::{Datelike, Duration as ChronoDuration};
@@ -136,6 +137,12 @@ pub(crate) struct AppState {
     pub rate_limit_map: Arc<DashMap<String, RateLimitEntry>>,
     /// Serializes full Kotak login attempts — see `routes::KotakLoginDeps::login_lock`.
     pub kotak_login_lock: Arc<Mutex<()>>,
+    /// `false` once the session watchdog finds the live Kotak session no longer
+    /// works (HTTP 401, or repeated probe failures) — even while `kotak` still
+    /// holds a client object. `/api/auth/kotak` reports `connected` as
+    /// `kotak.is_some() && this`, so a silently-dead session shows as
+    /// disconnected and the dashboard offers a Reconnect.
+    pub kotak_session_healthy: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +478,138 @@ async fn run_daily_kotak_recycle(
 }
 
 // ---------------------------------------------------------------------------
+// Kotak session watchdog — mid-day reconnection
+// ---------------------------------------------------------------------------
+
+/// Runs forever. Every 20 s during market hours it checks that the live Kotak
+/// session still works and, if it doesn't, clears it and logs back in from env
+/// credentials — the mid-session counterpart to the fixed 09:05 / 09:15
+/// triggers, which cannot help with a session that dies at (say) 12:30.
+///
+/// Deliberately conservative so it never fights the other login paths or
+/// thrashes a flaky network:
+///  - probe is a lightweight authenticated call (`get_order_book`)
+///  - a *transient* probe failure is tolerated — only an HTTP 401/403
+///    (`SessionExpired`), or three failures in a row, counts as "dead"
+///  - **at most one re-login attempt per 5 minutes**, whatever the trigger
+///  - skipped entirely while any login holds `login_lock` (tried, not awaited)
+///  - only re-logs-in on weekdays inside market hours and only when env
+///    auto-login is configured; otherwise it just marks the session unhealthy
+///    so the dashboard shows "disconnected" and offers a manual Reconnect
+async fn run_kotak_session_watchdog(
+    handles: KotakAutoLoginHandles,
+    healthy: Arc<AtomicBool>,
+) {
+    use std::time::{Duration, Instant};
+    const PROBE_EVERY: Duration = Duration::from_secs(20);
+    const MIN_RELOGIN_GAP: Duration = Duration::from_secs(300);
+    const MAX_TRANSIENT_FAILS: u32 = 3;
+
+    // Let the startup / 09:05 / 09:15 login paths finish before probing.
+    tokio::time::sleep(Duration::from_secs(60)).await;
+
+    let mut last_relogin: Option<Instant> = None;
+    let mut transient_fails: u32 = 0;
+    let mut absent_streak: u32 = 0;
+
+    loop {
+        tokio::time::sleep(PROBE_EVERY).await;
+
+        // A login is already running (startup, a daily trigger, the recycle, or
+        // a manual Connect). Let it finish and re-probe next cycle.
+        if handles.login_lock.try_lock().is_err() {
+            continue;
+        }
+
+        let dead = {
+            let client = handles.kotak.lock().await.clone();
+            match client {
+                None => {
+                    healthy.store(false, Ordering::Relaxed);
+                    transient_fails = 0;
+                    absent_streak += 1;
+                    // One missed observation can just be the 09:10 recycle's
+                    // brief gap between clearing and re-logging-in.
+                    absent_streak >= 2
+                }
+                Some(c) => {
+                    absent_streak = 0;
+                    match c.get_order_book().await {
+                        Ok(_) => {
+                            healthy.store(true, Ordering::Relaxed);
+                            transient_fails = 0;
+                            false
+                        }
+                        Err(e) if e.is_session_expired() => {
+                            healthy.store(false, Ordering::Relaxed);
+                            transient_fails = 0;
+                            tracing::warn!(error = %e, "Kotak session watchdog — session rejected (expired)");
+                            true
+                        }
+                        Err(e) => {
+                            transient_fails += 1;
+                            tracing::warn!(error = %e, fails = transient_fails, "Kotak session watchdog — probe failed");
+                            if transient_fails >= MAX_TRANSIENT_FAILS {
+                                healthy.store(false, Ordering::Relaxed);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        if !dead {
+            continue;
+        }
+
+        // Outside market hours the daily clear / trigger tasks own the session
+        // lifecycle — don't rebuild one they may be about to tear down.
+        if !shared_domain::is_market_open() {
+            continue;
+        }
+        if !routes::auto_login_enabled_by_env() {
+            recycle_log(&handles, "ERROR", serde_json::json!({
+                "event": "KOTAK_SESSION_DEAD",
+                "level": "ERROR",
+                "message": "Kotak session is no longer usable and KOTAK_AUTO_LOGIN=false — reconnect from the dashboard",
+            })).await;
+            continue;
+        }
+        if last_relogin.is_some_and(|t| t.elapsed() < MIN_RELOGIN_GAP) {
+            continue;
+        }
+
+        last_relogin = Some(Instant::now());
+        transient_fails = 0;
+        absent_streak = 0;
+
+        recycle_log(&handles, "ERROR", serde_json::json!({
+            "event": "KOTAK_SESSION_RELOGIN",
+            "level": "ERROR",
+            "message": "Kotak session lost mid-day — clearing it and logging back in from env credentials",
+        })).await;
+
+        clear_kotak_session(
+            &handles.kotak, &handles.ws_task, &handles.ws_tx,
+            &handles.pool, &handles.log_tx, "session watchdog",
+        ).await;
+
+        match routes::try_env_auto_login(handles.as_deps(), "session watchdog").await {
+            Ok(()) => {
+                healthy.store(true, Ordering::Relaxed);
+                tracing::info!("Kotak session watchdog — re-login succeeded");
+            }
+            Err(e) => {
+                tracing::error!(reason = %e, "Kotak session watchdog — re-login failed; retrying after the 5-minute gap");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -552,6 +691,9 @@ async fn main() {
     // `routes::KotakLoginDeps::login_lock` for why a plain `is_none()` check
     // before deciding to log in isn't enough on its own.
     let kotak_login_lock = Arc::new(tokio::sync::Mutex::new(()));
+    // Starts optimistic — the watchdog flips it within ~20s if the restored /
+    // freshly-built session doesn't actually work.
+    let kotak_session_healthy = Arc::new(AtomicBool::new(true));
 
     let ws_scrips = std::env::var("KOTAK_SCRIPS").unwrap_or_else(|_| "nse_cm|11536".into());
     let scrip_store = Arc::new(RwLock::new(None));
@@ -706,11 +848,13 @@ async fn main() {
         // whole download; see `run_daily_kotak_recycle`.
         tokio::spawn(run_daily_kotak_recycle(9, 10, "daily recycle 09:10 IST", handles.clone()));
         tokio::spawn(run_daily_kotak_trigger(
-            handles,
+            handles.clone(),
             shared_domain::MARKET_OPEN_HOUR,
             shared_domain::MARKET_OPEN_MINUTE,
             "market open 09:15 IST",
         ));
+        // Mid-day safety net: rebuild the session if it dies between triggers.
+        tokio::spawn(run_kotak_session_watchdog(handles, Arc::clone(&kotak_session_healthy)));
     }
 
 
@@ -753,6 +897,7 @@ async fn main() {
         ws_tx,
         rate_limit_map: Arc::new(DashMap::new()),
         kotak_login_lock,
+        kotak_session_healthy,
     };
 
     let app = Router::new()

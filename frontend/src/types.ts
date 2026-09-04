@@ -157,7 +157,12 @@ export interface KotakForm {
 }
 
 export interface KotakStatus {
+  /** A session exists AND the watchdog's last probe of it succeeded. */
   connected: boolean;
+  /** A session object is held in memory (may or may not still work). */
+  session_present?: boolean;
+  /** The watchdog's last probe of the held session succeeded. */
+  session_healthy?: boolean;
   /** All five KOTAK_* env vars are set, so "Auto Connect" needs no form input. */
   has_env_credentials: boolean;
   /** KOTAK_TOTP_SECRET / KOTAK_TOTP_HASH is set, so the TOTP field can be left blank. */

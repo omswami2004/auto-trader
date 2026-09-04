@@ -62,21 +62,34 @@ export function KotakLoginPanel({ serverBase, onServerBaseChange }: {
   }, [serverBase]);
 
   useEffect(() => {
+    if (!serverBase) return;
+    let cancelled = false;
     async function checkState() {
-      if (!serverBase) return;
       try {
         const res = await apiFetch(serverBase, '/api/auth/kotak');
-        if (res.ok) {
-          const data: KotakStatus = await res.json();
-          setKotakStatus(data);
-          if (data.connected) {
-            setStatus('ok');
-            setMsg('Connected ✓');
-          }
-        }
-      } catch (e) {}
+        if (!res.ok || cancelled) return;
+        const data: KotakStatus = await res.json();
+        if (cancelled) return;
+        setKotakStatus(data);
+        // Don't stomp on a Connect/Reconnect click that's mid-flight.
+        setStatus((prev) => {
+          if (prev === 'loading') return prev;
+          if (data.connected) return 'ok';
+          // The session dropped out from under us (expired, cleared server-side).
+          if (prev === 'ok') return 'idle';
+          return prev;
+        });
+        setMsg((prev) => {
+          if (data.connected) return 'Connected ✓';
+          return prev === 'Connected ✓' ? 'Session dropped — click Reconnect' : prev;
+        });
+      } catch {}
     }
     checkState();
+    // Poll so a mid-session drop (and a later auto-recovery) is reflected
+    // without a page reload.
+    const id = setInterval(checkState, 30_000);
+    return () => { cancelled = true; clearInterval(id); };
   }, [serverBase]);
 
   useEffect(() => {
@@ -194,15 +207,15 @@ export function KotakLoginPanel({ serverBase, onServerBaseChange }: {
           <Plug size={12} />
           {status === 'loading' && autoStatus !== 'loading' ? 'Connecting…' : status === 'ok' ? 'Connected' : 'Connect'}
         </button>
-        {kotakStatus?.has_env_credentials && status !== 'ok' && (
+        {kotakStatus?.has_env_credentials && (
           <button
             onClick={handleAutoConnect}
             disabled={status === 'loading'}
-            title="Log in using the server's configured KOTAK_* env credentials — no fields required"
+            title="Log in (or re-log-in) using the server's configured KOTAK_* env credentials — no fields required. Auto-OTP is generated server-side."
             className="flex items-center gap-1.5 px-3 py-1 bg-secondary hover:bg-secondary/90 disabled:opacity-50 text-on-secondary text-xs font-semibold rounded transition-colors shadow-sm"
           >
             <Zap size={12} />
-            {autoStatus === 'loading' ? 'Connecting…' : 'Auto Connect'}
+            {autoStatus === 'loading' ? 'Connecting…' : status === 'ok' ? 'Reconnect' : 'Auto Connect'}
           </button>
         )}
         {msg && (

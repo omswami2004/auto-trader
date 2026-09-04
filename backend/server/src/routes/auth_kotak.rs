@@ -496,7 +496,10 @@ pub async fn kotak_login_handler(
     };
 
     match perform_kotak_login(KotakLoginDeps::from_state(&state), resolved, "manual login").await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "connected"}))).into_response(),
+        Ok(()) => {
+            state.kotak_session_healthy.store(true, std::sync::atomic::Ordering::Relaxed);
+            (StatusCode::OK, Json(serde_json::json!({"status": "connected"}))).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
 }
@@ -512,7 +515,10 @@ pub async fn kotak_auto_login_handler(State(state): State<AppState>) -> impl Int
     };
 
     match perform_kotak_login(KotakLoginDeps::from_state(&state), resolved, "Auto Connect button").await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "connected"}))).into_response(),
+        Ok(()) => {
+            state.kotak_session_healthy.store(true, std::sync::atomic::Ordering::Relaxed);
+            (StatusCode::OK, Json(serde_json::json!({"status": "connected"}))).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
 }
@@ -584,8 +590,18 @@ pub async fn kotak_status_handler(State(state): State<AppState>) -> Json<serde_j
         None
     };
 
+    // A session object can linger in memory after Kotak has already stopped
+    // honouring it (token aged out, access token reset elsewhere). The watchdog
+    // flips `kotak_session_healthy` when a probe proves that, so `connected`
+    // means "a session exists *and* it still works" — otherwise the dashboard
+    // would show a green tick over a session that can't place a single order.
+    let session_healthy = state.kotak_session_healthy.load(std::sync::atomic::Ordering::Relaxed);
+    let has_client = state.kotak.lock().await.is_some();
+
     Json(serde_json::json!({
-        "connected": state.kotak.lock().await.is_some(),
+        "connected": has_client && session_healthy,
+        "session_present": has_client,
+        "session_healthy": session_healthy,
         "has_env_credentials": has_env_credentials,
         "has_totp_secret": has_totp_secret,
         "auto_login_enabled": auto_login_enabled,
@@ -625,6 +641,7 @@ pub async fn disconnect_kotak(State(state): State<AppState>) -> impl IntoRespons
     *state.ws_tx.lock().await = None;
     // 3. Remove the Kotak client from memory
     *state.kotak.lock().await = None;
+    state.kotak_session_healthy.store(false, std::sync::atomic::Ordering::Relaxed);
     // 4. Delete session from DB so it isn't restored on next startup
     let _ = sqlx::query("DELETE FROM kotak_session").execute(&state.db_pool).await;
 
@@ -643,7 +660,7 @@ pub async fn system_status(State(state): State<AppState>) -> impl IntoResponse {
     };
     let kotak_ok = {
         let k = state.kotak.lock().await;
-        k.is_some()
+        k.is_some() && state.kotak_session_healthy.load(std::sync::atomic::Ordering::Relaxed)
     };
     // Formatted server-side in IST: this value is only ever meaningful in
     // market time, so there is nothing for the browser to guess at.

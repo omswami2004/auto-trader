@@ -393,11 +393,37 @@ pub struct MonitoredPosition {
     /// rejecting broker cannot put the engine in a retry loop.
     #[serde(default)]
     pub exit_attempts: i32,
+    /// LIVE mode: how many times an entry order has actually been sent to the
+    /// broker for this position. Capped ([`MAX_ENTRY_ATTEMPTS`]) so an entry
+    /// whose send keeps failing ambiguously cannot loop forever.
+    #[serde(default)]
+    pub entry_attempts: i32,
+    /// LIVE mode: IST timestamp (`%Y-%m-%d %H:%M:%S`) of the most recent entry
+    /// send attempt. Used to throttle retries after a failed `get_limits`
+    /// pre-flight, and to bound how long the reconciler hunts the order book
+    /// for an entry whose send outcome is unknown.
+    #[serde(default)]
+    pub entry_attempt_at: Option<String>,
+    /// LIVE mode: an entry order was sent but the broker's response was lost
+    /// (connect failure / timeout / unparseable reply), so it may or may not be
+    /// live at the broker. While set, `decide_live` will not send another entry
+    /// and the reconciler hunts the order book for the matching fill to adopt.
+    /// Never `true` alongside a known `entry_order_id`.
+    #[serde(default)]
+    pub entry_send_uncertain: bool,
+    /// LIVE mode: the quantity of the entry order whose send outcome is unknown
+    /// — used to match it in the order book while `entry_send_uncertain` is set.
+    #[serde(default)]
+    pub entry_uncertain_qty: Option<i32>,
     /// LIVE mode: set when the engine has given up acting on this position
     /// automatically. Requires manual intervention; no further orders are sent.
     #[serde(default)]
     pub live_halt: Option<String>,
 }
+
+/// LIVE mode: hard cap on entry send attempts for one position — see
+/// [`MonitoredPosition::entry_attempts`].
+pub const MAX_ENTRY_ATTEMPTS: i32 = 3;
 
 fn default_tick_size() -> f64 { 0.05 }
 

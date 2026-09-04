@@ -300,6 +300,21 @@ fn find_csv_url(val: &serde_json::Value, segment: &str) -> Option<String> {
 // KotakClient
 // ---------------------------------------------------------------------------
 
+/// Map an authenticated-endpoint response to [`KotakError::SessionExpired`] when
+/// the broker rejects the session token / sid with HTTP 401 or 403, otherwise
+/// pass the response straight through.
+///
+/// Every call that sends the `Auth` + `Sid` headers routes its response through
+/// here, so a session that has aged out surfaces as a clean `SessionExpired`
+/// (which the server's watchdog acts on by re-logging-in) instead of a
+/// downstream JSON-decode failure that looks like a transient network blip.
+fn check_session_status(resp: reqwest::Response) -> Result<reqwest::Response, KotakError> {
+    match resp.status().as_u16() {
+        status @ (401 | 403) => Err(KotakError::SessionExpired { status }),
+        _ => Ok(resp),
+    }
+}
+
 /// Async HTTP client for the Kotak Neo Trade API.
 #[derive(Clone)]
 pub struct KotakClient {
@@ -495,12 +510,11 @@ impl KotakClient {
             req = req.header("X-Forwarded-For", ip);
         }
 
-        let raw = req
-            .form(&[("jData", j_data.as_str())])
-            .send()
-            .await?
-            .json::<KotakOrderResponse>()
-            .await?;
+        let raw = check_session_status(
+            req.form(&[("jData", j_data.as_str())]).send().await?,
+        )?
+        .json::<KotakOrderResponse>()
+        .await?;
 
         if !raw.stat.eq_ignore_ascii_case("Ok") {
             return Err(KotakError::OrderRejected {
@@ -564,12 +578,11 @@ impl KotakClient {
             req = req.header("X-Forwarded-For", ip);
         }
 
-        let raw = req
-            .form(&[("jData", j_data.as_str())])
-            .send()
-            .await?
-            .json::<KotakOrderResponse>()
-            .await?;
+        let raw = check_session_status(
+            req.form(&[("jData", j_data.as_str())]).send().await?,
+        )?
+        .json::<KotakOrderResponse>()
+        .await?;
 
         if !raw.stat.eq_ignore_ascii_case("Ok") {
             return Err(KotakError::OrderRejected {
@@ -621,12 +634,11 @@ impl KotakClient {
             req = req.header("X-Forwarded-For", ip);
         }
 
-        let raw = req
-            .form(&[("jData", j_data.as_str())])
-            .send()
-            .await?
-            .json::<KotakOrderResponse>()
-            .await?;
+        let raw = check_session_status(
+            req.form(&[("jData", j_data.as_str())]).send().await?,
+        )?
+        .json::<KotakOrderResponse>()
+        .await?;
 
         if !raw.stat.eq_ignore_ascii_case("Ok") {
             return Err(KotakError::OrderRejected {
@@ -668,9 +680,7 @@ impl KotakClient {
             req = req.header("X-Forwarded-For", ip);
         }
 
-        let raw = req
-            .send()
-            .await?
+        let raw = check_session_status(req.send().await?)?
             .json::<KotakPositionsResponse>()
             .await?;
 
@@ -711,9 +721,7 @@ impl KotakClient {
             req = req.header("X-Forwarded-For", ip);
         }
 
-        let raw = req
-            .send()
-            .await?
+        let raw = check_session_status(req.send().await?)?
             .json::<KotakOrderBookResponse>()
             .await?;
 
@@ -752,10 +760,7 @@ impl KotakClient {
             req = req.header("X-Forwarded-For", ip);
         }
 
-        let raw = req
-            .form(&[("jData", j_data)])
-            .send()
-            .await?
+        let raw = check_session_status(req.form(&[("jData", j_data)]).send().await?)?
             .json::<KotakLimitsResponse>()
             .await?;
 
