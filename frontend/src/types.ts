@@ -41,6 +41,11 @@ export interface TradingConfig {
   pre_t1_trail_factor: number;
   /** When true, trading is halted for the day and open positions have been liquidated. */
   kill_switch_active?: boolean;
+  /** Entry buy window as a percent of the entry→target-1 distance. 0 (default)
+   * buys the moment the trigger is crossed; >0 refuses to chase past
+   * `entry ± pct% * (target1 - entry)` and waits for a pull-back into that
+   * window. Clamped to [0, 100] on save. */
+  entry_window_pct: number;
 }
 
 export interface PaperTrade {
@@ -112,6 +117,10 @@ export interface MonitoredPosition {
   id: string;
   signal: {
     instrument_name: string;
+    /** Option strike, e.g. 58200 — absent for equity / futures signals. */
+    strike?: number | null;
+    /** "CE" | "PE" for options; absent otherwise. */
+    option_type?: string | null;
     action: string;
     entry_condition: string;
     entry_price: number;
@@ -145,6 +154,9 @@ export interface MonitoredPosition {
   };
   ltp?: number;
   ws_scrip_key?: string | null;
+  /** `[low, high]` premium window the engine will buy a WaitingForEntry row in,
+   * from the live `entry_window_pct` config. Absent when the feature is off. */
+  entry_zone?: [number, number] | null;
 }
 
 export interface KotakForm {

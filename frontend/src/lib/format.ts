@@ -2,7 +2,18 @@
 // Formatting helpers
 // ---------------------------------------------------------------------------
 
-import type { PaperTrade } from '../types';
+import type { MonitoredPosition, PaperTrade } from '../types';
+
+/** Full contract label — "SENSEX 82000 CE" — instead of the bare underlying,
+ * which is ambiguous when several strikes are being traded at once. Falls back
+ * to just the name for equity / futures signals. */
+export function instrumentLabel(p: Pick<MonitoredPosition, 'signal'>): string {
+  const s = p.signal;
+  const parts: string[] = [s.instrument_name];
+  if (s.strike != null) parts.push(String(s.strike));
+  if (s.option_type) parts.push(s.option_type);
+  return parts.join(' ');
+}
 
 export function fmt(n: number) {
   return new Intl.NumberFormat('en-IN', {

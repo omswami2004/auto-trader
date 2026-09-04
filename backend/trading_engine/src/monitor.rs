@@ -151,6 +151,52 @@ fn entry_past_target1(signal: &TradeSignal, ltp: f64) -> Option<f64> {
     (ltp >= t1).then_some(t1)
 }
 
+/// The premium window the engine will actually buy `signal` in — `None` when
+/// `entry_window_pct` is `0` (the classic "buy as soon as the trigger is
+/// crossed" behaviour, which has no far edge to draw).
+///
+/// With `entry_window_pct > 0` the window is `w = pct/100 * (target1 - entry)`
+/// wide (falling back to `pct/100 * entry` when the signal has no usable
+/// target-1), sitting on the buy side of the trigger:
+///
+/// * `ABOVE X` → `[X, X + w]` — take the breakout, never chase past `X + w`
+/// * `BELOW X` → `[X - w, X]` — take the breakdown, never chase past `X - w`
+///
+/// `pct` is clamped to `[0, 100]` on save, so `X + w` never exceeds target 1.
+pub fn entry_buy_window(signal: &TradeSignal, cfg: &TradingConfig) -> Option<(f64, f64)> {
+    if cfg.entry_window_pct <= 0.0 {
+        return None;
+    }
+    let cond = signal.entry_condition.to_uppercase();
+    if cond != "ABOVE" && cond != "BELOW" {
+        return None;
+    }
+    let x = signal.entry_price;
+    let base = match signal.targets.first() {
+        Some(&t1) if (t1 - x).abs() > 1e-9 => (t1 - x).abs(),
+        _ => x.abs(),
+    };
+    let w = (cfg.entry_window_pct / 100.0) * base;
+    Some(if cond == "BELOW" { (x - w, x) } else { (x, x + w) })
+}
+
+/// Whether `ltp` is where the engine should buy `signal` right now.
+///
+/// With `entry_window_pct = 0` this is the classic one-sided check
+/// (`ltp >= entry` for `ABOVE`, `ltp <= entry` for `BELOW`); with a window
+/// configured it also refuses a price that has run past the far edge — that
+/// position keeps waiting for a pull-back. Unknown entry conditions never fire.
+fn entry_triggered(signal: &TradeSignal, ltp: f64, cfg: &TradingConfig) -> bool {
+    match entry_buy_window(signal, cfg) {
+        Some((low, high)) => ltp >= low && ltp <= high,
+        None => match signal.entry_condition.to_uppercase().as_str() {
+            "ABOVE" => ltp >= signal.entry_price,
+            "BELOW" => ltp <= signal.entry_price,
+            _ => false,
+        },
+    }
+}
+
 /// Pre-T1 trailing stop (see `TradingConfig::pre_t1_trailing`): feed one LTP
 /// observation into `peak_ltp` and, once the peak has covered
 /// `pre_t1_trail_arm_pct` % of the entry→target-1 distance, set
@@ -1569,6 +1615,7 @@ async fn adopt_manual(
         entry_send_uncertain: false,
         entry_uncertain_qty: None,
         live_halt: None,
+        entry_zone: None,
     };
 
     { positions.write().await.push(new_pos); }
@@ -1688,12 +1735,7 @@ fn decide_live(
                 });
             }
             let ltp = ltp?;
-            let triggered = match pos.signal.entry_condition.to_uppercase().as_str() {
-                "ABOVE" => ltp >= pos.signal.entry_price,
-                "BELOW" => ltp <= pos.signal.entry_price,
-                _ => false,
-            };
-            if !triggered {
+            if !entry_triggered(&pos.signal, ltp, cfg) {
                 return None;
             }
             // The signal's move is already spent — entering here just books
@@ -2779,6 +2821,7 @@ pub async fn start_position_monitor(
                                     entry_send_uncertain: false,
                                     entry_uncertain_qty: None,
                                     live_halt: None,
+                                    entry_zone: None,
                                 });
                                 let snapshot = pos_guard.clone();
                                 drop(pos_guard);
@@ -2914,12 +2957,7 @@ pub async fn start_position_monitor(
                     } else {
                     match pos.state {
                         TradeState::WaitingForEntry => {
-                            let triggered = match pos.signal.entry_condition.to_uppercase().as_str() {
-                                "ABOVE" => ltp >= pos.signal.entry_price,
-                                "BELOW" => ltp <= pos.signal.entry_price,
-                                _ => false,
-                            };
-                            triggered.then(|| {
+                            entry_triggered(&pos.signal, ltp, &cfg).then(|| {
                                 // The signal's move is already spent — entering
                                 // here just books target 1 on the next tick.
                                 // Usually a mis-resolved contract or a stale
@@ -3177,6 +3215,7 @@ mod tests {
             entry_send_uncertain: false,
             entry_uncertain_qty: None,
             live_halt: None,
+            entry_zone: None,
         }
     }
 
@@ -3198,6 +3237,7 @@ mod tests {
             pre_t1_trail_arm_pct: 60.0,
             pre_t1_trail_factor: 0.5,
             kill_switch_active: false,
+            entry_window_pct: 0.0,
         }
     }
 
@@ -3307,6 +3347,53 @@ mod tests {
             decide_live(&pos, &ltp, &cfg_with_lots(1, 3), false, true),
             Some(LiveAction::PlaceEntry { .. })
         ));
+    }
+
+    #[test]
+    fn entry_window_off_is_the_classic_one_sided_trigger() {
+        let cfg = cfg_with_lots(1, 3); // entry_window_pct defaults to 0
+        let mut sig = position_created_at("").signal; // ABOVE 120, targets [140,160]
+        assert!(entry_buy_window(&sig, &cfg).is_none());
+        assert!(!entry_triggered(&sig, 119.99, &cfg));
+        assert!(entry_triggered(&sig, 120.0, &cfg));
+        assert!(entry_triggered(&sig, 500.0, &cfg)); // chases any price above
+        sig.entry_condition = "BELOW".to_string();
+        assert!(entry_triggered(&sig, 120.0, &cfg));
+        assert!(entry_triggered(&sig, 1.0, &cfg));
+        assert!(!entry_triggered(&sig, 120.01, &cfg));
+    }
+
+    #[test]
+    fn entry_window_caps_the_chase_and_waits_for_a_pullback() {
+        let mut cfg = cfg_with_lots(1, 3);
+        cfg.entry_window_pct = 25.0; // 25% of (140 - 120) = 5 wide
+        let sig = position_created_at("").signal; // ABOVE 120, target1 140
+
+        assert_eq!(entry_buy_window(&sig, &cfg), Some((120.0, 125.0)));
+        assert!(!entry_triggered(&sig, 119.0, &cfg)); // breakout not reached
+        assert!(entry_triggered(&sig, 120.0, &cfg));
+        assert!(entry_triggered(&sig, 125.0, &cfg));
+        assert!(!entry_triggered(&sig, 125.01, &cfg)); // ran past — wait for pullback
+        assert!(!entry_triggered(&sig, 131.0, &cfg));
+    }
+
+    #[test]
+    fn entry_window_mirrors_below_and_falls_back_without_a_target() {
+        let mut cfg = cfg_with_lots(1, 3);
+        cfg.entry_window_pct = 25.0;
+
+        let mut sig = position_created_at("").signal;
+        sig.entry_condition = "BELOW".to_string(); // BELOW 120, target1 140 -> w = 5
+        assert_eq!(entry_buy_window(&sig, &cfg), Some((115.0, 120.0)));
+        assert!(entry_triggered(&sig, 120.0, &cfg));
+        assert!(entry_triggered(&sig, 115.0, &cfg));
+        assert!(!entry_triggered(&sig, 114.99, &cfg));
+        assert!(!entry_triggered(&sig, 121.0, &cfg));
+
+        // No usable target -> width is a percent of the entry price (120 * 25%).
+        sig.entry_condition = "ABOVE".to_string();
+        sig.targets.clear();
+        assert_eq!(entry_buy_window(&sig, &cfg), Some((120.0, 150.0)));
     }
 
     #[test]

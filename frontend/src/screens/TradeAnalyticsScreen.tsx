@@ -1,6 +1,6 @@
 import { CheckCircle2, Info, Shield } from 'lucide-react';
 import { usePortfolioSnapshot } from '../hooks/usePortfolioSnapshot';
-import { balanceLabel, fmt, formatExitReason, todayIsoIST } from '../lib/format';
+import { balanceLabel, fmt, formatExitReason, instrumentLabel, todayIsoIST } from '../lib/format';
 
 export function TradeAnalyticsScreen({ serverBase }: { serverBase: string }) {
   const { portfolio, positions, realizedPnl, liveMtmPnl } = usePortfolioSnapshot(serverBase);
@@ -66,7 +66,7 @@ export function TradeAnalyticsScreen({ serverBase }: { serverBase: string }) {
               <div key={p.id} className="bg-surface-container-lowest rounded-xl border border-outline-variant shadow-sm overflow-hidden">
                 <div className="p-4 border-b border-outline-variant flex items-center justify-between bg-surface-container-low">
                   <div className="flex items-center gap-2">
-                    <span className="font-bold text-on-surface text-sm">{p.signal.instrument_name}</span>
+                    <span className="font-bold text-on-surface text-sm">{instrumentLabel(p)}</span>
                     {p.ws_scrip_key && (
                       <span className="text-xs text-on-surface-variant bg-surface-container px-2 py-0.5 rounded font-mono">{p.ws_scrip_key}</span>
                     )}

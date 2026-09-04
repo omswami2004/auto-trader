@@ -219,6 +219,22 @@ pub struct TradingConfig {
     /// When true, halts all future trade entries and ignores new incoming signals.
     #[serde(default)]
     pub kill_switch_active: bool,
+    /// Entry buy window, as a percent of the signal's entry→target-1 distance.
+    ///
+    /// `0` (default) is the classic behaviour: buy the instant the trigger price
+    /// is crossed in the signalled direction, however far it has already run.
+    ///
+    /// `> 0` refuses to chase. The engine only buys while the premium sits
+    /// within `w = entry_window_pct/100 * (target1 - entry)` of the trigger:
+    /// `[entry, entry + w]` for an `ABOVE` signal, `[entry - w, entry]` for a
+    /// `BELOW` one. If the price has already gapped past the far edge when the
+    /// signal arrives, the position waits in `WaitingForEntry` for a pull-back
+    /// into the window — and expires unfilled at the 15:29 cutoff if it never
+    /// comes (same as any un-triggered signal). Falls back to a percent of the
+    /// entry price when the signal has no usable target-1. Clamped to
+    /// `[0, 100]` on save, so the window can never reach past target 1.
+    #[serde(default)]
+    pub entry_window_pct: f64,
 }
 
 fn default_entry_mp() -> f64 { 5.0 }
@@ -419,6 +435,13 @@ pub struct MonitoredPosition {
     /// automatically. Requires manual intervention; no further orders are sent.
     #[serde(default)]
     pub live_halt: Option<String>,
+    /// Display-only: the `[low, high]` premium window the engine will buy this
+    /// `WaitingForEntry` position in, derived from the live `entry_window_pct`
+    /// config (see [`TradingConfig::entry_window_pct`]). Populated by the
+    /// positions API just before returning, `None` when the feature is off or
+    /// the row is not awaiting entry. Not meaningfully persisted.
+    #[serde(default)]
+    pub entry_zone: Option<(f64, f64)>,
 }
 
 /// LIVE mode: hard cap on entry send attempts for one position — see
