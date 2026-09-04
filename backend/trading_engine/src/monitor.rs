@@ -264,9 +264,10 @@ const MAX_EXIT_ATTEMPTS: i32 = 3;
 const FUNDS_BUFFER_INR: f64 = 500.0;
 
 /// IST time from which no new entry is taken and every position still waiting
-/// for its trigger is dropped — we do not open anything this close to the bell.
+/// for its trigger is dropped — the last minute before the 15:40 close is left
+/// alone so a fresh position is never opened as the session ends.
 const NO_ENTRY_HOUR: u32 = 15;
-const NO_ENTRY_MINUTE: u32 = 29;
+const NO_ENTRY_MINUTE: u32 = 39;
 
 /// Attempts made against `get_limits` in a single entry pre-flight before
 /// giving up on *this* tick. A transient blip usually clears within a retry or
@@ -290,7 +291,7 @@ const ENTRY_RETRY_THROTTLE: Duration = Duration::from_secs(5);
 /// retried well before it matters.
 const UNCERTAIN_ENTRY_GRACE: Duration = Duration::from_secs(20);
 
-/// True at/after 15:29 IST, for the remainder of the day.
+/// True at/after 15:39 IST, for the remainder of the day.
 fn is_entry_cutoff_passed() -> bool {
     use chrono::Timelike;
     let now = shared_domain::now_ist();
@@ -301,9 +302,9 @@ fn is_entry_cutoff_passed() -> bool {
 /// Why a `WaitingForEntry` position should be abandoned rather than left to
 /// watch for its trigger, or `None` if it is still live.
 ///
-/// `entry_cutoff` (today's 15:29 IST bell) only catches a position while the
+/// `entry_cutoff` (today's 15:39 IST bell) only catches a position while the
 /// engine is running continuously through that moment. A crash, redeploy, or
-/// manual restart that happens to fall before 15:29 lets a never-triggered
+/// manual restart that happens to fall before 15:39 lets a never-triggered
 /// position survive in the DB as `WaitingForEntry` with nothing to expire it;
 /// reloaded on the next day's startup, `entry_cutoff` is false again (it's
 /// morning), so it sits watching the LTP feed and can trigger a real entry
@@ -2908,7 +2909,7 @@ pub async fn start_position_monitor(
                 // ── Pass 1: read-only scan ────────────────────────── //
                 for (i, pos) in pos_guard.iter().enumerate() {
                     // Entries that will never be taken are dropped before the LTP
-                    // guard below — a cancelled or rewritten signal, or the 15:29
+                    // guard below — a cancelled or rewritten signal, or the 15:39
                     // cutoff after which we do not open anything new.
                     if matches!(pos.state, TradeState::WaitingForEntry) {
                         if cfg.kill_switch_active {
@@ -3269,7 +3270,7 @@ mod tests {
 
     #[test]
     fn stale_entry_reason_past_cutoff_always_expires() {
-        // 15:29 cutoff wins regardless of created_at, including a position
+        // 15:39 cutoff wins regardless of created_at, including a position
         // created moments ago today.
         let pos = position_created_at(&shared_domain::current_ist_timestamp_string());
         assert_eq!(stale_entry_reason(&pos, true), Some("EOD_NO_ENTRY"));

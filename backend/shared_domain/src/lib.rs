@@ -229,8 +229,8 @@ pub struct TradingConfig {
     /// `[entry, entry + w]` for an `ABOVE` signal, `[entry - w, entry]` for a
     /// `BELOW` one. If the price has already gapped past the far edge when the
     /// signal arrives, the position waits in `WaitingForEntry` for a pull-back
-    /// into the window — and expires unfilled at the 15:29 cutoff if it never
-    /// comes (same as any un-triggered signal). Falls back to a percent of the
+    /// into the window — and expires unfilled at the 15:39 no-entry cutoff if it
+    /// never comes (same as any un-triggered signal). Falls back to a percent of the
     /// entry price when the signal has no usable target-1. Clamped to
     /// `[0, 100]` on save, so the window can never reach past target 1.
     #[serde(default)]

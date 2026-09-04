@@ -114,7 +114,7 @@ export function SettingsBar({ serverBase }: { serverBase: string }) {
     { key: 'entry_market_protection', label: 'Entry MP %',
       info: 'Kotak market-price protection on LIVE entry buys: the order can fill at most this % above the trigger price, so a spike can’t fill you arbitrarily worse. Protective exits always use 0.' },
     { key: 'entry_window_pct', label: 'Entry Window %',
-      info: 'Refuses to chase a runaway entry. As a % of the entry→target-1 distance: for "ABOVE X" the engine only buys between X and X + this%×(target1−X); for "BELOW X", between X − that and X. If the price has already blown past the far edge, the trade waits for a pull-back into the window and expires unfilled at 15:29 if it never comes. 0 = off (buy the instant the trigger is crossed). Applies in PAPER and LIVE.' },
+      info: 'Refuses to chase a runaway entry. As a % of the entry→target-1 distance: for "ABOVE X" the engine only buys between X and X + this%×(target1−X); for "BELOW X", between X − that and X. If the price has already blown past the far edge, the trade waits for a pull-back into the window and expires unfilled at the 15:39 no-entry cutoff if it never comes. 0 = off (buy the instant the trigger is crossed). Applies in PAPER and LIVE.' },
   ];
 
   useEffect(() => {
