@@ -219,6 +219,22 @@ pub struct TradingConfig {
     /// When true, halts all future trade entries and ignores new incoming signals.
     #[serde(default)]
     pub kill_switch_active: bool,
+    /// Entry buy window, as a percent of the signal's entry→target-1 distance.
+    ///
+    /// `0` (default) is the classic behaviour: buy the instant the trigger price
+    /// is crossed in the signalled direction, however far it has already run.
+    ///
+    /// `> 0` refuses to chase. The engine only buys while the premium sits
+    /// within `w = entry_window_pct/100 * (target1 - entry)` of the trigger:
+    /// `[entry, entry + w]` for an `ABOVE` signal, `[entry - w, entry]` for a
+    /// `BELOW` one. If the price has already gapped past the far edge when the
+    /// signal arrives, the position waits in `WaitingForEntry` for a pull-back
+    /// into the window — and expires unfilled at the 15:39 no-entry cutoff if it
+    /// never comes (same as any un-triggered signal). Falls back to a percent of the
+    /// entry price when the signal has no usable target-1. Clamped to
+    /// `[0, 100]` on save, so the window can never reach past target 1.
+    #[serde(default)]
+    pub entry_window_pct: f64,
 }
 
 fn default_entry_mp() -> f64 { 5.0 }
@@ -393,11 +409,53 @@ pub struct MonitoredPosition {
     /// rejecting broker cannot put the engine in a retry loop.
     #[serde(default)]
     pub exit_attempts: i32,
+    /// LIVE mode: how many times an entry order has actually been sent to the
+    /// broker for this position. Capped ([`MAX_ENTRY_ATTEMPTS`]) so an entry
+    /// whose send keeps failing ambiguously cannot loop forever.
+    #[serde(default)]
+    pub entry_attempts: i32,
+    /// LIVE mode: IST timestamp (`%Y-%m-%d %H:%M:%S`) of the most recent entry
+    /// send attempt. Used to throttle retries after a failed `get_limits`
+    /// pre-flight, and to bound how long the reconciler hunts the order book
+    /// for an entry whose send outcome is unknown.
+    #[serde(default)]
+    pub entry_attempt_at: Option<String>,
+    /// LIVE mode: an entry order was sent but the broker's response was lost
+    /// (connect failure / timeout / unparseable reply), so it may or may not be
+    /// live at the broker. While set, `decide_live` will not send another entry
+    /// and the reconciler hunts the order book for the matching fill to adopt.
+    /// Never `true` alongside a known `entry_order_id`.
+    #[serde(default)]
+    pub entry_send_uncertain: bool,
+    /// LIVE mode: the quantity of the entry order whose send outcome is unknown
+    /// — used to match it in the order book while `entry_send_uncertain` is set.
+    #[serde(default)]
+    pub entry_uncertain_qty: Option<i32>,
+    /// LIVE mode: the last market entry send for this position was hard-rejected
+    /// by the broker / exchange RMS — the generic `Not_Ok` (`code 1041`-style)
+    /// that Kotak returns for market orders in the first minutes after the
+    /// 09:15 open. While set, `decide_live` retries the entry as an IOC **limit**
+    /// order (price a protection-band above the touch, never past the entry buy
+    /// window) instead of another market order. Cleared once the position leaves
+    /// `WaitingForEntry`.
+    #[serde(default)]
+    pub entry_retry_as_limit: bool,
     /// LIVE mode: set when the engine has given up acting on this position
     /// automatically. Requires manual intervention; no further orders are sent.
     #[serde(default)]
     pub live_halt: Option<String>,
+    /// Display-only: the `[low, high]` premium window the engine will buy this
+    /// `WaitingForEntry` position in, derived from the live `entry_window_pct`
+    /// config (see [`TradingConfig::entry_window_pct`]). Populated by the
+    /// positions API just before returning, `None` when the feature is off or
+    /// the row is not awaiting entry. Not meaningfully persisted.
+    #[serde(default)]
+    pub entry_zone: Option<(f64, f64)>,
 }
+
+/// LIVE mode: hard cap on entry send attempts for one position — see
+/// [`MonitoredPosition::entry_attempts`].
+pub const MAX_ENTRY_ATTEMPTS: i32 = 3;
 
 fn default_tick_size() -> f64 { 0.05 }
 

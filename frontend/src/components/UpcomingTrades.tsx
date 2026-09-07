@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Info } from 'lucide-react';
 import type { MonitoredPosition } from '../types';
 import { apiFetch } from '../lib/api';
-import { fmt } from '../lib/format';
+import { fmt, instrumentLabel } from '../lib/format';
 import { useAuth } from '../context/AuthContext';
 import { QtyInput } from './QtyInput';
 import { SyncWithKotakButton } from './SyncWithKotakButton';
@@ -177,7 +177,7 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                     <td className="px-3 py-2.5 font-bold text-on-surface relative">
                       <div className={`flex items-center gap-1.5 relative group/tooltip ${openTooltip === p.id ? 'z-[60]' : 'hover:z-[60]'}`}>
                         <div className="flex flex-col">
-                          <span>{p.signal.instrument_name}</span>
+                          <span>{instrumentLabel(p)}</span>
                           {p.ltp !== undefined && p.ltp !== null && (
                             <span className="text-[10px] text-on-surface-variant font-normal">LTP: <span className="text-primary font-mono-code font-semibold">₹{fmt(p.ltp)}</span></span>
                           )}
@@ -219,7 +219,12 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                       }`}>{p.signal.action}</span>
                     </td>
                     <td className="px-3 py-2.5 text-on-surface font-mono-code">
-                      {p.signal.entry_condition} ₹{fmt(p.signal.entry_price)}
+                      <div>{p.signal.entry_condition} ₹{fmt(p.signal.entry_price)}</div>
+                      {p.entry_zone && (
+                        <div className="text-[10px] text-secondary font-normal" title="The engine only buys inside this premium window — it will not chase a price that has run past it.">
+                          Buy zone: ₹{fmt(p.entry_zone[0])}–₹{fmt(p.entry_zone[1])}
+                        </div>
+                      )}
                     </td>
                     <td className="px-3 py-2.5 text-error font-mono-code font-semibold">₹{fmt(p.signal.stop_loss)}</td>
                     <td className="px-3 py-2.5">
@@ -242,7 +247,7 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
               <div key={p.id} className="bg-surface rounded-xl border border-outline-variant p-3.5 shadow-sm space-y-3">
                 <div className="flex items-center justify-between">
                   <div>
-                    <div className="font-bold text-on-surface text-sm">{p.signal.instrument_name}</div>
+                    <div className="font-bold text-on-surface text-sm">{instrumentLabel(p)}</div>
                     {p.ltp !== undefined && p.ltp !== null && (
                       <div className="text-[11px] text-on-surface-variant">
                         LTP: <span className="text-primary font-mono-code font-semibold">₹{fmt(p.ltp)}</span>
@@ -258,6 +263,11 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                   <div>
                     <div className="text-on-surface-variant text-[10px] uppercase font-sans">Trigger</div>
                     <div className="font-semibold text-on-surface">{p.signal.entry_condition} ₹{fmt(p.signal.entry_price)}</div>
+                    {p.entry_zone && (
+                      <div className="text-[10px] text-secondary font-normal font-sans">
+                        Buy ₹{fmt(p.entry_zone[0])}–₹{fmt(p.entry_zone[1])}
+                      </div>
+                    )}
                   </div>
                   <div>
                     <div className="text-on-surface-variant text-[10px] uppercase font-sans">Stop Loss</div>
@@ -320,7 +330,7 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                       <td className="px-3 py-2.5 font-bold text-on-surface relative">
                         <div className={`flex items-center gap-1.5 relative ${openTooltip === p.id ? 'z-[60]' : 'hover:z-[60]'}`}>
                           <div className="flex flex-col">
-                            <span>{p.signal.instrument_name}</span>
+                            <span>{instrumentLabel(p)}</span>
                             {p.ws_scrip_key && <span className="text-[10px] text-on-surface-variant font-normal">{p.ws_scrip_key}</span>}
                           </div>
                           <button
@@ -406,7 +416,7 @@ export function UpcomingTrades({ serverBase }: { serverBase: string }) {
                 <div key={p.id} className="bg-surface rounded-xl border border-outline-variant p-3.5 shadow-sm space-y-3">
                   <div className="flex items-center justify-between">
                     <div>
-                      <div className="font-bold text-on-surface text-sm">{p.signal.instrument_name}</div>
+                      <div className="font-bold text-on-surface text-sm">{instrumentLabel(p)}</div>
                       {p.ws_scrip_key && <div className="text-[10px] text-on-surface-variant">{p.ws_scrip_key}</div>}
                     </div>
                     <span className="px-2 py-0.5 rounded text-xs font-label-caps font-bold uppercase bg-primary-container text-on-primary">

@@ -43,7 +43,15 @@ pub async fn positions_handler(State(state): State<AppState>) -> Json<Vec<Monito
         .cloned()
         .collect();
 
+    let cfg = state.trading_cfg.read().await.clone();
+
     for p in &mut live_positions {
+        // Show where the engine will actually buy a still-waiting position when
+        // the entry buy window is configured (see TradingConfig::entry_window_pct).
+        if matches!(p.state, TradeState::WaitingForEntry) {
+            p.entry_zone = trading_engine::entry_buy_window(&p.signal, &cfg);
+        }
+
         // Try ws_scrip_key first (precise lookup like "nse_fo|51386")
         if let Some(ref key) = p.ws_scrip_key {
             if let Some(price) = state.prices.get(key) {
