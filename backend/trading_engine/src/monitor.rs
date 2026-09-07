@@ -389,6 +389,47 @@ fn build_market_order(
     order
 }
 
+/// IOC limit order (`L`, validity `IOC`) at `price`. Used as the fallback when
+/// the exchange RMS refuses a plain market order — which it does for the first
+/// few minutes after the 09:15 open. `price` must already be tick-rounded.
+fn build_ioc_limit_order(
+    base: &shared_domain::OrderRequest,
+    txn: shared_domain::TransactionType,
+    qty: i32,
+    price: f64,
+) -> shared_domain::OrderRequest {
+    use shared_domain::{OrderType, Validity};
+    let mut order = base.clone();
+    order.quantity = qty.to_string();
+    order.transaction_type = txn;
+    order.order_type = OrderType::Limit;
+    order.price = format!("{price:.2}");
+    order.trigger_price = "0".to_string();
+    order.market_protection = "0".to_string();
+    order.validity = Validity::Ioc;
+    order
+}
+
+/// The IOC-limit price for an entry retry: a protection band above the touch,
+/// never above the entry buy window's far edge (when one is configured), tick-
+/// rounded down. `None` if there is no usable reference price.
+fn entry_retry_limit_price(
+    signal: &shared_domain::TradeSignal,
+    cfg: &TradingConfig,
+    ltp: f64,
+    tick: f64,
+) -> Option<f64> {
+    if ltp <= 0.0 {
+        return None;
+    }
+    let mut cap = ltp * (1.0 + cfg.entry_market_protection.max(0.0) / 100.0);
+    if let Some((_, high)) = entry_buy_window(signal, cfg) {
+        cap = cap.min(high);
+    }
+    let price = round_down_tick(cap, tick);
+    (price > 0.0).then_some(price)
+}
+
 // ---------------------------------------------------------------------------
 // LIVE mode — broker call wrappers
 //
@@ -556,6 +597,10 @@ struct LiveLeg {
     entry_uncertain_qty: Option<i32>,
     /// Whole seconds since that send attempt, for the grace-window timeout.
     entry_attempt_secs: Option<i64>,
+    /// The entry is being retried as an IOC limit (a prior market send was
+    /// RMS-rejected). An IOC limit that comes back cancelled with nothing
+    /// filled is a miss to retry, not a signal to drop.
+    entry_retry_as_limit: bool,
     sl_order_id: Option<String>,
     pending_exit_order_id: Option<String>,
     pending_exit_qty: i32,
@@ -602,6 +647,7 @@ async fn reconcile_live_orders(
                 entry_send_uncertain: p.entry_send_uncertain && p.entry_order_id.is_none(),
                 entry_uncertain_qty: p.entry_uncertain_qty,
                 entry_attempt_secs: secs_since_ist(&p.entry_attempt_at),
+                entry_retry_as_limit: p.entry_retry_as_limit,
                 sl_order_id: p.sl_order_id.clone(),
                 pending_exit_order_id: p.pending_exit_order_id.clone(),
                 pending_exit_qty: p.pending_exit_qty,
@@ -731,6 +777,7 @@ async fn reconcile_live_orders(
                             p.state = TradeState::Active;
                             p.entry_order_id = None;
                             p.entry_cancel_sent = false;
+                            p.entry_retry_as_limit = false;
                         }).await;
 
                         let fees = FeeCalculator::calculate(filled, avg, "BUY", leg.is_options, brokerage);
@@ -754,10 +801,25 @@ async fn reconcile_live_orders(
                                 "entry order {oid} filled only {filled} of {ordered} — running the position on the filled quantity"
                             )).await;
                         }
+                    } else if leg.entry_retry_as_limit && ord.is_cancelled() {
+                        // An IOC limit retry that expired unfilled — a miss, not
+                        // a failure. Release the id and let decide_live fire the
+                        // next limit once the throttle clears (it re-checks the
+                        // trigger / buy window first, so a price that has left
+                        // the window simply stops the retries).
+                        with_position(positions, &leg.pos_id, |p| {
+                            p.entry_order_id = None;
+                            p.entry_cancel_sent = false;
+                        }).await;
+                        tracing::info!(
+                            instrument = %leg.instrument, %oid,
+                            "LIVE entry IOC limit expired unfilled — will retry"
+                        );
                     } else {
                         with_position(positions, &leg.pos_id, |p| {
                             p.state = TradeState::Closed;
                             p.entry_order_id = None;
+                            p.entry_retry_as_limit = false;
                         }).await;
                         loud_error(db_tx, log_tx, &leg.instrument, &format!(
                             "entry order {oid} came back {} ({}) with nothing filled — signal dropped",
@@ -1615,6 +1677,7 @@ async fn adopt_manual(
         entry_attempt_at: None,
         entry_send_uncertain: false,
         entry_uncertain_qty: None,
+        entry_retry_as_limit: false,
         live_halt: None,
         entry_zone: None,
     };
@@ -1638,9 +1701,11 @@ fn resolved_adopt_avg(user_entered: f64, broker_avg: f64) -> f64 {
 
 #[derive(Debug, PartialEq)]
 enum LiveAction {
-    /// Entry condition met — check funds, then send a market buy for `qty`.
-    /// `ltp` is the price that triggered it, used to size the funds check.
-    PlaceEntry { qty: i32, ltp: f64 },
+    /// Entry condition met — check funds, then buy `qty`. `ltp` is the price
+    /// that triggered it, used to size the funds check. `limit_price` is `None`
+    /// for the normal market buy; `Some(p)` when a prior market send was
+    /// RMS-rejected and the retry must go in as an IOC limit at `p`.
+    PlaceEntry { qty: i32, ltp: f64, limit_price: Option<f64> },
     /// Give up on an entry that will not be taken; cancel it if it is in flight.
     /// `loud` surfaces it as an ERROR the dashboard highlights (the signal
     /// looked wrong) rather than a routine INFO line (e.g. the EOD cutoff).
@@ -1763,7 +1828,16 @@ fn decide_live(
                     return None;
                 }
             }
-            Some(LiveAction::PlaceEntry { qty, ltp })
+            // A prior market send was RMS-rejected (the post-open `Not_Ok`).
+            // Retry as an IOC limit at a protection band above the touch,
+            // capped to the buy window. If there is no usable limit price,
+            // fall through to another market try rather than stall.
+            let limit_price = if pos.entry_retry_as_limit {
+                entry_retry_limit_price(&pos.signal, cfg, ltp, pos.tick_size)
+            } else {
+                None
+            };
+            Some(LiveAction::PlaceEntry { qty, ltp, limit_price })
         }
 
         TradeState::Active | TradeState::Target1Hit => {
@@ -1916,6 +1990,10 @@ struct LiveCtx {
     entry_cancel_sent: bool,
     sl_order_id: Option<String>,
     executed_qty: i32,
+    tick_size: f64,
+    /// LTP-map key, for pricing an IOC limit fallback when a market order is
+    /// refused. `None` only if the position never resolved a websocket key.
+    ws_key: Option<String>,
 }
 
 /// Cancel any resting stop, then market-sell the whole holding.
@@ -1936,6 +2014,8 @@ async fn exec_exit_all(
     kotak: &KotakHandle,
     db_tx: &mpsc::Sender<DbWriteMessage>,
     log_tx: &broadcast::Sender<String>,
+    cfg: &TradingConfig,
+    ref_ltp: Option<f64>,
     pos_id: &str,
     ctx: &LiveCtx,
     qty: i32,
@@ -1973,14 +2053,8 @@ async fn exec_exit_all(
         with_position(positions, pos_id, forget_stop).await;
     }
 
-    // IOC so that if Kotak internally converts our MKT to a limit (which it
-    // does for F&O options), the order auto-cancels the moment it isn't
-    // immediately filled rather than sitting open and tying up margin. The
-    // reconciler will re-detect the SL condition on the next tick and retry.
-    let mut order = build_market_order(&ctx.base, shared_domain::TransactionType::Sell, qty, 0.0);
-    order.validity = shared_domain::Validity::Ioc;
-    match kotak_place(kotak, &order).await {
-        Ok(order_id) => {
+    match place_exit_sell(kotak, db_tx, log_tx, ctx, cfg, ref_ltp, qty, reason).await {
+        Some(order_id) => {
             with_position(positions, pos_id, |p| {
                 p.pending_exit_order_id = Some(order_id.clone());
                 p.pending_exit_qty = qty;
@@ -1988,6 +2062,41 @@ async fn exec_exit_all(
                 p.force_exit = None;
                 p.override_exit_price = None;
             }).await;
+        }
+        None => {
+            bump_exit_attempts(positions, db_tx, log_tx, pos_id, &ctx.instrument).await;
+        }
+    }
+}
+
+/// Place a protective sell for `qty`: an IOC **market** order first, and — if
+/// the exchange RMS hard-rejects it (the generic `Not_Ok` it returns for market
+/// orders in the first minutes after the 09:15 open) — one IOC **limit** retry
+/// a protection band below the touch. Returns the broker order id on success.
+///
+/// The limit retry is only attempted after a definitive rejection, never after
+/// an ambiguous / session failure, because a rejected order provably never
+/// rested and a follow-up cannot double-sell. Logs its own outcome; the caller
+/// owns all position-state bookkeeping.
+#[allow(clippy::too_many_arguments)]
+async fn place_exit_sell(
+    kotak: &KotakHandle,
+    db_tx: &mpsc::Sender<DbWriteMessage>,
+    log_tx: &broadcast::Sender<String>,
+    ctx: &LiveCtx,
+    cfg: &TradingConfig,
+    ref_ltp: Option<f64>,
+    qty: i32,
+    reason: &str,
+) -> Option<String> {
+    // IOC so that if Kotak internally converts our MKT to a limit (which it
+    // does for F&O options), the order auto-cancels the moment it isn't
+    // immediately filled rather than sitting open and tying up margin. The
+    // reconciler re-detects the SL condition on the next tick and retries.
+    let mut mkt = build_market_order(&ctx.base, shared_domain::TransactionType::Sell, qty, 0.0);
+    mkt.validity = shared_domain::Validity::Ioc;
+    let rejected = match kotak_place(kotak, &mkt).await {
+        Ok(order_id) => {
             tracing::info!(instrument = %ctx.instrument, %order_id, qty, reason, "LIVE market exit placed");
             live_info(db_tx, log_tx, json!({
                 "event": "LIVE_EXIT_PLACED",
@@ -1997,12 +2106,57 @@ async fn exec_exit_all(
                 "reason": reason,
                 "mode": "LIVE",
             })).await;
+            return Some(order_id);
         }
-        Err(e) => {
+        Err(e) if e.is_session_expired() || e.is_ambiguous() => {
             loud_error(db_tx, log_tx, &ctx.instrument, &format!(
                 "market exit ({reason}) for {qty} was rejected: {e} — the position is unprotected until a new stop is placed"
             )).await;
-            bump_exit_attempts(positions, db_tx, log_tx, pos_id, &ctx.instrument).await;
+            return None;
+        }
+        Err(e) => e,
+    };
+
+    // Hard rejection — try an IOC limit a protection band below the touch.
+    let Some(ltp) = ref_ltp.filter(|v| *v > 0.0) else {
+        loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+            "market exit ({reason}) for {qty} was rejected: {rejected} — no live price for a limit fallback, still unprotected"
+        )).await;
+        return None;
+    };
+    let floor = round_down_tick(
+        ltp * (1.0 - cfg.entry_market_protection.max(0.0) / 100.0),
+        ctx.tick_size,
+    );
+    if floor <= 0.0 {
+        loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+            "market exit ({reason}) for {qty} was rejected: {rejected} — could not price a limit fallback, still unprotected"
+        )).await;
+        return None;
+    }
+    let lim = build_ioc_limit_order(&ctx.base, shared_domain::TransactionType::Sell, qty, floor);
+    match kotak_place(kotak, &lim).await {
+        Ok(order_id) => {
+            loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                "market exit ({reason}) for {qty} was refused ({rejected}) — placed an IOC limit sell at ₹{floor:.2} instead"
+            )).await;
+            live_info(db_tx, log_tx, json!({
+                "event": "LIVE_EXIT_PLACED",
+                "instrument": ctx.instrument,
+                "order_id": order_id,
+                "qty": qty,
+                "reason": reason,
+                "order_type": "IOC_LIMIT",
+                "limit_price": round2(floor),
+                "mode": "LIVE",
+            })).await;
+            Some(order_id)
+        }
+        Err(e2) => {
+            loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                "exit ({reason}) for {qty} rejected as both market ({rejected}) and limit ({e2}) — the position is unprotected"
+            )).await;
+            None
         }
     }
 }
@@ -2014,6 +2168,7 @@ async fn exec_live_action(
     db_tx: &mpsc::Sender<DbWriteMessage>,
     log_tx: &broadcast::Sender<String>,
     cfg: &TradingConfig,
+    ltp_map: &Arc<DashMap<String, f64>>,
     pending: &LivePending,
 ) -> bool {
     let ctx = {
@@ -2028,11 +2183,20 @@ async fn exec_live_action(
             entry_cancel_sent: p.entry_cancel_sent,
             sl_order_id: p.sl_order_id.clone(),
             executed_qty: p.executed_qty,
+            tick_size: p.tick_size,
+            ws_key: p.ws_scrip_key.clone(),
         }
     };
 
+    // Freshest LTP for this position, for pricing an IOC limit fallback.
+    let ctx_ltp = ctx
+        .ws_key
+        .as_ref()
+        .and_then(|k| ltp_map.get(k.as_str()).map(|r| *r))
+        .filter(|v| *v > 0.0);
+
     match &pending.action {
-        LiveAction::PlaceEntry { qty, ltp } => {
+        LiveAction::PlaceEntry { qty, ltp, limit_price } => {
             // Stamp the attempt time first, so decide_live's throttle spaces
             // out the next pre-flight even if this one bails out below.
             with_position(positions, &pending.pos_id, |p| {
@@ -2041,7 +2205,10 @@ async fn exec_live_action(
 
             // Pre-flight funds check. We must be able to pay for the order and
             // still have the buffer left over — the account is never run to zero.
-            let order_value = *qty as f64 * *ltp;
+            // Size it on the limit price when this is a limit retry (it is the
+            // most we could pay), otherwise on the touch.
+            let price_for_funds = limit_price.unwrap_or(*ltp);
+            let order_value = *qty as f64 * price_for_funds;
             let required = order_value + FUNDS_BUFFER_INR;
             let mut limits_err = None;
             for attempt in 1..=LIMITS_PREFLIGHT_ATTEMPTS {
@@ -2079,12 +2246,15 @@ async fn exec_live_action(
                 return true;
             }
 
-            let order = build_market_order(
-                &ctx.base,
-                shared_domain::TransactionType::Buy,
-                *qty,
-                cfg.entry_market_protection,
-            );
+            let order = match limit_price {
+                Some(lp) => build_ioc_limit_order(
+                    &ctx.base, shared_domain::TransactionType::Buy, *qty, *lp,
+                ),
+                None => build_market_order(
+                    &ctx.base, shared_domain::TransactionType::Buy, *qty,
+                    cfg.entry_market_protection,
+                ),
+            };
             match kotak_place(kotak, &order).await {
                 Ok(order_id) => {
                     with_position(positions, &pending.pos_id, |p| {
@@ -2092,16 +2262,38 @@ async fn exec_live_action(
                         p.entry_cancel_sent = false;
                         p.entry_send_uncertain = false;
                         p.entry_uncertain_qty = None;
-                        p.entry_attempts += 1;
+                        // A market buy that the broker accepted is one real
+                        // attempt. An accepted IOC limit may simply expire
+                        // unfilled — that is a miss, not a spent attempt, so it
+                        // is not counted here (the reconciler retries it).
+                        if limit_price.is_none() {
+                            p.entry_attempts += 1;
+                        }
                     }).await;
-                    tracing::info!(instrument = %ctx.instrument, %order_id, qty, "LIVE entry market buy placed");
-                    live_info(db_tx, log_tx, json!({
-                        "event": "LIVE_ENTRY_PLACED",
-                        "instrument": ctx.instrument,
-                        "order_id": order_id,
-                        "qty": qty,
-                        "mode": "LIVE",
-                    })).await;
+                    match limit_price {
+                        Some(lp) => {
+                            tracing::info!(instrument = %ctx.instrument, %order_id, qty, limit = lp, "LIVE entry IOC limit buy placed");
+                            live_info(db_tx, log_tx, json!({
+                                "event": "LIVE_ENTRY_PLACED",
+                                "instrument": ctx.instrument,
+                                "order_id": order_id,
+                                "qty": qty,
+                                "order_type": "IOC_LIMIT",
+                                "limit_price": round2(*lp),
+                                "mode": "LIVE",
+                            })).await;
+                        }
+                        None => {
+                            tracing::info!(instrument = %ctx.instrument, %order_id, qty, "LIVE entry market buy placed");
+                            live_info(db_tx, log_tx, json!({
+                                "event": "LIVE_ENTRY_PLACED",
+                                "instrument": ctx.instrument,
+                                "order_id": order_id,
+                                "qty": qty,
+                                "mode": "LIVE",
+                            })).await;
+                        }
+                    }
                 }
                 Err(e) if e.is_session_expired() => {
                     // HTTP 401/403 — the gateway rejected the request before it
@@ -2129,13 +2321,39 @@ async fn exec_live_action(
                         "entry order send got no broker verdict ({e}) — it MAY be live at Kotak. Reconciling against the order book before anything else; check your broker app now"
                     )).await;
                 }
-                Err(e) => {
-                    // A real rejection from the exchange / RMS.
-                    with_position(positions, &pending.pos_id, |p| p.entry_attempts += 1).await;
+                Err(e) if limit_price.is_none() => {
+                    // A real rejection of the market buy from the exchange / RMS
+                    // — the generic post-open `Not_Ok`. Don't drop the signal:
+                    // switch this position to IOC-limit retries inside the buy
+                    // window. decide_live re-checks the trigger each tick and
+                    // stops on its own if the price leaves the window or the
+                    // 15:39 cutoff passes.
+                    with_position(positions, &pending.pos_id, |p| {
+                        p.entry_attempts += 1;
+                        p.entry_retry_as_limit = true;
+                    }).await;
                     loud_error(db_tx, log_tx, &ctx.instrument, &format!(
-                        "entry market buy for {qty} was rejected: {e} — signal dropped, it will not be retried"
+                        "entry market buy for {qty} was rejected: {e} — retrying as an IOC limit inside the buy window, nothing bought yet"
                     )).await;
-                    with_position(positions, &pending.pos_id, |p| p.state = TradeState::Closed).await;
+                }
+                Err(e) => {
+                    // The IOC limit retry was itself hard-rejected. Count it;
+                    // give up only once the attempt cap is hit.
+                    let mut attempts = shared_domain::MAX_ENTRY_ATTEMPTS;
+                    with_position(positions, &pending.pos_id, |p| {
+                        p.entry_attempts += 1;
+                        attempts = p.entry_attempts;
+                    }).await;
+                    if attempts >= shared_domain::MAX_ENTRY_ATTEMPTS {
+                        loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                            "entry limit buy for {qty} was rejected: {e} — {attempts} attempts, signal dropped"
+                        )).await;
+                        with_position(positions, &pending.pos_id, |p| p.state = TradeState::Closed).await;
+                    } else {
+                        loud_error(db_tx, log_tx, &ctx.instrument, &format!(
+                            "entry limit buy for {qty} was rejected: {e} — retrying (attempt {attempts})"
+                        )).await;
+                    }
                 }
             }
         }
@@ -2157,6 +2375,7 @@ async fn exec_live_action(
             with_position(positions, &pending.pos_id, |p| {
                 p.state = TradeState::Closed;
                 p.entry_order_id = None;
+                p.entry_retry_as_limit = false;
             }).await;
             if *loud {
                 loud_error(db_tx, log_tx, &ctx.instrument, &format!("entry not taken — {reason}")).await;
@@ -2191,30 +2410,21 @@ async fn exec_live_action(
                 "mode": "LIVE",
             })).await;
 
-            // IOC: Kotak converts F&O market orders to limits; IOC prevents a
-            // stale limit from sitting open and blocking the next exit cycle.
-            let mut sell = build_market_order(&ctx.base, shared_domain::TransactionType::Sell, *slice, 0.0);
-            sell.validity = shared_domain::Validity::Ioc;
-            match kotak_place(kotak, &sell).await {
-                Ok(order_id) => {
+            // IOC market, falling back to an IOC limit if the RMS refuses it
+            // (Kotak converts F&O market orders to limits anyway; IOC keeps a
+            // miss from sitting open and blocking the next exit cycle).
+            match place_exit_sell(kotak, db_tx, log_tx, &ctx, cfg, ctx_ltp, *slice, "TGT1_PARTIAL").await {
+                Some(order_id) => {
                     with_position(positions, &pending.pos_id, |p| {
-                        p.pending_exit_order_id = Some(order_id.clone());
+                        p.pending_exit_order_id = Some(order_id);
                         p.pending_exit_qty = *slice;
                         p.pending_exit_reason = Some("TGT1_PARTIAL".to_string());
                     }).await;
-                    tracing::info!(instrument = %ctx.instrument, %order_id, slice, keep, "LIVE target 1 slice placed");
-                    live_info(db_tx, log_tx, json!({
-                        "event": "LIVE_EXIT_PLACED",
-                        "instrument": ctx.instrument,
-                        "order_id": order_id,
-                        "qty": slice,
-                        "reason": "TGT1_PARTIAL",
-                        "mode": "LIVE",
-                    })).await;
+                    tracing::info!(instrument = %ctx.instrument, slice, keep, "LIVE target 1 slice placed");
                 }
-                Err(e) => {
+                None => {
                     loud_error(db_tx, log_tx, &ctx.instrument, &format!(
-                        "target-1 sell of {slice} was rejected: {e} — still holding the full {} at the trailed stop, squaring off at market",
+                        "target-1 sell of {slice} could not be placed — still holding the full {} at the trailed stop, squaring off at market",
                         ctx.executed_qty
                     )).await;
                     with_position(positions, &pending.pos_id, |p| {
@@ -2242,7 +2452,7 @@ async fn exec_live_action(
         }
 
         LiveAction::ExitAll { qty, reason } => {
-            exec_exit_all(positions, kotak, db_tx, log_tx, &pending.pos_id, &ctx, *qty, reason).await;
+            exec_exit_all(positions, kotak, db_tx, log_tx, cfg, ctx_ltp, &pending.pos_id, &ctx, *qty, reason).await;
         }
 
         LiveAction::ManualSell { qty } => {
@@ -2352,7 +2562,7 @@ async fn live_tick(
 
     // ── Act (no positions lock across broker calls) ──────────────────── //
     for pending in &decisions {
-        mutated |= exec_live_action(positions, kotak, db_tx, log_tx, cfg, pending).await;
+        mutated |= exec_live_action(positions, kotak, db_tx, log_tx, cfg, ltp_map, pending).await;
     }
 
     // ── Drop closed positions, cancelling anything they still track ──── //
@@ -2821,6 +3031,7 @@ pub async fn start_position_monitor(
                                     entry_attempt_at: None,
                                     entry_send_uncertain: false,
                                     entry_uncertain_qty: None,
+                                    entry_retry_as_limit: false,
                                     live_halt: None,
                                     entry_zone: None,
                                 });
@@ -3215,6 +3426,7 @@ mod tests {
             entry_attempt_at: None,
             entry_send_uncertain: false,
             entry_uncertain_qty: None,
+            entry_retry_as_limit: false,
             live_halt: None,
             entry_zone: None,
         }
@@ -3436,6 +3648,52 @@ mod tests {
             Some(LiveAction::AbandonEntry { loud, .. }) => assert!(loud),
             other => panic!("expected a loud AbandonEntry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn entry_retry_limit_price_caps_at_protection_band_then_buy_window() {
+        let mut cfg = cfg_with_lots(1, 3); // entry_market_protection 5.0
+        let sig = position_created_at("").signal; // ABOVE 120, target1 140
+
+        // Window off: a protection band above the touch, tick-rounded.
+        assert!(entry_buy_window(&sig, &cfg).is_none());
+        let p = entry_retry_limit_price(&sig, &cfg, 121.0, 0.05).unwrap();
+        assert!((p - 127.05).abs() < 1e-6, "got {p}"); // 121 * 1.05
+
+        // Window on and tighter than the band: the window's far edge wins.
+        cfg.entry_window_pct = 25.0; // [120, 125]
+        let p = entry_retry_limit_price(&sig, &cfg, 121.0, 0.05).unwrap();
+        assert!((p - 125.0).abs() < 1e-6, "got {p}");
+
+        // No usable price -> nothing to place.
+        assert_eq!(entry_retry_limit_price(&sig, &cfg, 0.0, 0.05), None);
+    }
+
+    #[test]
+    fn decide_live_retries_a_rejected_entry_as_a_limit() {
+        let ltp = Arc::new(DashMap::new());
+        let mut pos = live_waiting_position(&ltp); // ltp 121, entry 120 ABOVE
+        let cfg = cfg_with_lots(1, 3);
+
+        // Normal first attempt is a plain market buy.
+        match decide_live(&pos, &ltp, &cfg, false, true) {
+            Some(LiveAction::PlaceEntry { limit_price, .. }) => assert_eq!(limit_price, None),
+            other => panic!("expected a market PlaceEntry, got {other:?}"),
+        }
+
+        // After a market rejection the retry carries an IOC limit price.
+        pos.entry_retry_as_limit = true;
+        match decide_live(&pos, &ltp, &cfg, false, true) {
+            Some(LiveAction::PlaceEntry { limit_price: Some(p), .. }) => {
+                assert!((p - 127.05).abs() < 1e-6, "got {p}");
+            }
+            other => panic!("expected a limit PlaceEntry, got {other:?}"),
+        }
+
+        // A price that no longer satisfies the trigger stops the retries —
+        // decide_live re-checks entry_triggered before every limit send.
+        ltp.insert("nse_fo|999".to_string(), 119.0);
+        assert!(decide_live(&pos, &ltp, &cfg, false, true).is_none());
     }
 
     #[test]

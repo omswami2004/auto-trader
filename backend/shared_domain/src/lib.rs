@@ -431,6 +431,15 @@ pub struct MonitoredPosition {
     /// — used to match it in the order book while `entry_send_uncertain` is set.
     #[serde(default)]
     pub entry_uncertain_qty: Option<i32>,
+    /// LIVE mode: the last market entry send for this position was hard-rejected
+    /// by the broker / exchange RMS — the generic `Not_Ok` (`code 1041`-style)
+    /// that Kotak returns for market orders in the first minutes after the
+    /// 09:15 open. While set, `decide_live` retries the entry as an IOC **limit**
+    /// order (price a protection-band above the touch, never past the entry buy
+    /// window) instead of another market order. Cleared once the position leaves
+    /// `WaitingForEntry`.
+    #[serde(default)]
+    pub entry_retry_as_limit: bool,
     /// LIVE mode: set when the engine has given up acting on this position
     /// automatically. Requires manual intervention; no further orders are sent.
     #[serde(default)]
