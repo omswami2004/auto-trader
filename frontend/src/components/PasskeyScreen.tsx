@@ -50,10 +50,12 @@ export function PasskeyScreen({ onSuccess }: PasskeyScreenProps) {
     setLoading(true);
     setError('');
     const serverBase = getStoredServerBase();
-    console.group('[Passkey Verification]');
-    console.log('Window Origin:', typeof window !== 'undefined' ? window.location.origin : '');
-    console.log('Server Base:', serverBase ? serverBase : '(same-origin / relative)');
-    console.log('Passkey Entered:', '•'.repeat(code.length), `(${code.length} digits)`);
+    if (import.meta.env.DEV) {
+      console.group('[Passkey Verification]');
+      console.log('Window Origin:', typeof window !== 'undefined' ? window.location.origin : '');
+      console.log('Server Base:', serverBase ? serverBase : '(same-origin / relative)');
+      console.log('Passkey Entered:', '•'.repeat(code.length), `(${code.length} digits)`);
+    }
 
     try {
       const res = await apiFetch(serverBase, '/api/auth/verify-passkey', {
@@ -62,39 +64,57 @@ export function PasskeyScreen({ onSuccess }: PasskeyScreenProps) {
         body: JSON.stringify({ passkey: code }),
       });
 
-      console.log('Verify Passkey Response:', {
-        status: res.status,
-        statusText: res.statusText,
-        ok: res.ok,
-        headers: headersToObject(res.headers),
-      });
+      if (import.meta.env.DEV) {
+        console.log('Verify Passkey Response:', {
+          status: res.status,
+          statusText: res.statusText,
+          ok: res.ok,
+          headers: headersToObject(res.headers),
+        });
+      }
 
       if (res.ok) {
         const data = await res.json();
-        console.log('Passkey verification SUCCESS: Received JWT token.');
-        console.groupEnd();
+        if (import.meta.env.DEV) {
+          console.log('Passkey verification SUCCESS: Received JWT token.');
+          console.groupEnd();
+        }
         setToken(data.token);
         onSuccess();
       } else if (res.status === 429) {
         const retryAfter = parseInt(res.headers.get('Retry-After') || '900', 10);
-        console.warn(`[Passkey] Rate limited (429). Retry-After: ${retryAfter}s`);
-        console.groupEnd();
+        if (import.meta.env.DEV) {
+          console.warn(`[Passkey] Rate limited (429). Retry-After: ${retryAfter}s`);
+          console.groupEnd();
+        }
         setLockoutSecs(retryAfter);
         setError('Too many attempts. Locked out.');
         triggerShake();
         startLockoutTimer(retryAfter);
-      } else {
-        const errJson = await res.json().catch(() => ({}));
-        console.warn('[Passkey] Verification failed with status ' + res.status + ':', errJson);
-        console.groupEnd();
+      } else if (res.status === 401) {
+        if (import.meta.env.DEV) {
+          const errJson = await res.json().catch(() => ({}));
+          console.warn('[Passkey] Verification failed with status ' + res.status + ':', errJson);
+          console.groupEnd();
+        }
         setError('Invalid passkey');
         setPasskey(Array(6).fill(''));
         inputRefs.current[0]?.focus();
         triggerShake();
+      } else {
+        if (import.meta.env.DEV) {
+          const errJson = await res.json().catch(() => ({}));
+          console.error('[Passkey] Server error with status ' + res.status + ':', errJson);
+          console.groupEnd();
+        }
+        setError('Server error. Please try again later.');
+        triggerShake();
       }
     } catch (err) {
-      console.error('[Passkey] Network / CORS error during passkey verification:', err);
-      console.groupEnd();
+      if (import.meta.env.DEV) {
+        console.error('[Passkey] Network error during passkey verification:', err);
+        console.groupEnd();
+      }
       setError('Connection error');
       triggerShake();
     } finally {

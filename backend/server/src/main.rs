@@ -44,15 +44,6 @@ async fn auth_middleware(
     req: Request,
     next: Next,
 ) -> Result<axum::response::Response, StatusCode> {
-    if req.method() == axum::http::Method::OPTIONS {
-        tracing::debug!(
-            path = %req.uri().path(),
-            origin = ?req.headers().get("origin"),
-            "OPTIONS preflight passed through auth_middleware"
-        );
-        return Ok(next.run(req).await);
-    }
-
     let path = req.uri().path();
     
     // Allow public routes
@@ -90,7 +81,6 @@ async fn auth_middleware(
     let auth_secret = std::env::var("AUTH_SECRET")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| option_env!("AUTH_SECRET").map(String::from))
         .unwrap_or_default();
     if auth_secret.is_empty() {
         tracing::error!("AUTH_SECRET not configured");
@@ -185,10 +175,10 @@ async fn main() {
         .init();
 
     // Check PASSKEY status
-    if let Some(val) = std::env::var("PASSKEY").ok().or_else(|| option_env!("PASSKEY").map(String::from)) {
-        tracing::info!("PASSKEY is set (length: {})", val.len());
+    if std::env::var("PASSKEY").ok().filter(|s| !s.is_empty()).is_some() {
+        tracing::info!("PASSKEY is configured");
     } else {
-        tracing::warn!("PASSKEY is NOT set (neither in runtime env nor compiled in)!");
+        tracing::warn!("PASSKEY is NOT set!");
     }
 
     // 2. SQLite
@@ -567,19 +557,7 @@ async fn main() {
         .route("/api/auth/telegram/chats",          get(routes::telegram_chats_handler))
         .route("/api/auth/telegram/start",          post(routes::telegram_start_handler))
         .route("/api/auth/telegram/disconnect",     axum::routing::delete(routes::disconnect_telegram))
-        .route(
-            "/api/auth/verify-passkey",
-            post(routes::verify_passkey_handler).options(|| async {
-                (
-                    axum::http::StatusCode::NO_CONTENT,
-                    [
-                        ("access-control-allow-origin", "*"),
-                        ("access-control-allow-methods", "POST, OPTIONS"),
-                        ("access-control-allow-headers", "content-type, authorization"),
-                    ],
-                )
-            }),
-        )
+        .route("/api/auth/verify-passkey",          post(routes::verify_passkey_handler))
         .route("/api/strategy",                     get(routes::strategy_state_handler))
         .route("/api/strategy/decisions",           get(routes::strategy_decisions_handler))
         .route("/api/strategy/config",              get(routes::get_strategy_config_handler)

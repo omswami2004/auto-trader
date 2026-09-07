@@ -64,10 +64,7 @@ pub async fn verify_passkey_handler(
                 tracing::warn!(ip = %ip, origin = %origin, "Rate limit exceeded for passkey login");
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
-                    [
-                        ("access-control-allow-origin", "*"),
-                        ("Retry-After", "900"),
-                    ],
+                    [("Retry-After", "900")],
                     Json(serde_json::json!({"error": "Too many attempts. Try again later."})),
                 )
                     .into_response();
@@ -86,19 +83,17 @@ pub async fn verify_passkey_handler(
         current_attempts = 1;
     }
 
-    // 2. Verify passkey (support runtime env or compile-time env)
+    // 2. Verify passkey (runtime env)
     let env_passkey = match std::env::var("PASSKEY")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| option_env!("PASSKEY").map(String::from))
     {
         Some(k) => k,
         None => {
             tracing::error!(ip = %ip, origin = %origin, "PASSKEY not configured on server");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                [("access-control-allow-origin", "*")],
-                Json(serde_json::json!({"error": "PASSKEY not configured on server"})),
+                Json(serde_json::json!({"error": "Internal server error"})),
             )
                 .into_response();
         }
@@ -112,7 +107,6 @@ pub async fn verify_passkey_handler(
             ip = %ip,
             origin = %origin,
             req_len = req.passkey.len(),
-            env_len = env_passkey.len(),
             "Passkey length mismatch"
         );
         false
@@ -127,7 +121,6 @@ pub async fn verify_passkey_handler(
         );
         return (
             StatusCode::UNAUTHORIZED,
-            [("access-control-allow-origin", "*")],
             Json(serde_json::json!({"error": "Invalid passkey"})),
         )
             .into_response();
@@ -140,15 +133,13 @@ pub async fn verify_passkey_handler(
     let auth_secret = match std::env::var("AUTH_SECRET")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| option_env!("AUTH_SECRET").map(String::from))
     {
         Some(s) => s,
         None => {
             tracing::error!(ip = %ip, origin = %origin, "AUTH_SECRET not configured on server");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                [("access-control-allow-origin", "*")],
-                Json(serde_json::json!({"error": "AUTH_SECRET not configured on server"})),
+                Json(serde_json::json!({"error": "Internal server error"})),
             )
                 .into_response();
         }
@@ -181,7 +172,6 @@ pub async fn verify_passkey_handler(
     tracing::info!(ip = %ip, origin = %origin, "Successful passkey login");
     (
         StatusCode::OK,
-        [("access-control-allow-origin", "*")],
         Json(serde_json::json!({ "token": token })),
     ).into_response()
 }

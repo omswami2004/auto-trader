@@ -3,9 +3,21 @@
 // ---------------------------------------------------------------------------
 import { getToken, clearToken } from './auth';
 
-export const SERVER_BASE_STORAGE_KEY = 'server_base';
-export const SERVER_BASE_COOKIE = 'server_base';
+export const SERVER_BASE_STORAGE_KEY = 'server_base_v2';
+export const SERVER_BASE_COOKIE = 'server_base_v2';
 export const DEFAULT_SERVER_BASE = '';
+
+function cleanLegacyServerBase() {
+  if (typeof window === 'undefined') return;
+  try {
+    if (window.localStorage.getItem('server_base') !== null) {
+      window.localStorage.removeItem('server_base');
+    }
+    if (typeof document !== 'undefined') {
+      document.cookie = 'server_base=; path=/; max-age=0; SameSite=Lax';
+    }
+  } catch (_) {}
+}
 
 export function readCookie(name: string) {
   if (typeof document === 'undefined') return '';
@@ -35,19 +47,14 @@ export function isValidServerBase(value: string) {
 export function getStoredServerBase() {
   if (typeof window === 'undefined') return '';
 
-  let saved = window.localStorage.getItem(SERVER_BASE_STORAGE_KEY) ?? '';
-  const cookie = readCookie(SERVER_BASE_COOKIE);
-  let base = normalizeServerBase(saved || cookie || (import.meta.env.VITE_API_BASE_URL ?? DEFAULT_SERVER_BASE));
+  cleanLegacyServerBase();
 
-  // Purge legacy/stale cloud domain if the user is visiting via IP or localhost or different host
-  if (base.includes('axiosiiitl.dev') && !window.location.hostname.includes('axiosiiitl.dev')) {
-    console.debug('[API Config] Purging stale axiosiiitl.dev serverBase from storage & cookie');
-    window.localStorage.removeItem(SERVER_BASE_STORAGE_KEY);
-    if (typeof document !== 'undefined') {
-      document.cookie = `${SERVER_BASE_COOKIE}=; path=/; max-age=0; SameSite=Lax`;
-    }
-    base = '';
-  }
+  const saved = window.localStorage.getItem(SERVER_BASE_STORAGE_KEY);
+  const cookie = readCookie(SERVER_BASE_COOKIE);
+  const rawBase = saved !== null
+    ? saved
+    : (cookie || (import.meta.env.VITE_API_BASE_URL ?? DEFAULT_SERVER_BASE));
+  let base = normalizeServerBase(rawBase);
 
   // If base matches the current window.location.origin, normalize to '' so requests are same-origin
   if (base) {
@@ -59,7 +66,9 @@ export function getStoredServerBase() {
     } catch (_) {}
   }
 
-  console.debug('[API Config] Active server base:', base ? base : '(same-origin / relative)');
+  if (import.meta.env.DEV) {
+    console.debug('[API Config] Active server base:', base ? base : '(same-origin / relative)');
+  }
   return base;
 }
 
@@ -77,8 +86,7 @@ export function persistServerBase(value: string) {
   }
 
   if (typeof window !== 'undefined') {
-    if (normalized) window.localStorage.setItem(SERVER_BASE_STORAGE_KEY, normalized);
-    else window.localStorage.removeItem(SERVER_BASE_STORAGE_KEY);
+    window.localStorage.setItem(SERVER_BASE_STORAGE_KEY, normalized);
   }
 
   if (typeof document !== 'undefined') {
@@ -87,7 +95,9 @@ export function persistServerBase(value: string) {
       : `${SERVER_BASE_COOKIE}=; path=/; max-age=0; SameSite=Lax`;
   }
 
-  console.debug('[API Config] Persisted server base:', normalized ? normalized : '(same-origin / relative)');
+  if (import.meta.env.DEV) {
+    console.debug('[API Config] Persisted server base:', normalized ? normalized : '(same-origin / relative)');
+  }
   return normalized;
 }
 
@@ -112,33 +122,41 @@ export function apiFetch(serverBase: string, path: string, init?: RequestInit) {
   const targetUrl = apiUrl(serverBase, path);
   const method = init?.method || 'GET';
 
-  console.debug(`[API Request] ${method} ${targetUrl}`, {
-    serverBase: serverBase || '(same-origin)',
-    path,
-    targetUrl,
-    hasAuthToken: Boolean(token),
-  });
+  if (import.meta.env.DEV) {
+    console.debug(`[API Request] ${method} ${targetUrl}`, {
+      serverBase: serverBase || '(same-origin)',
+      path,
+      targetUrl,
+      hasAuthToken: Boolean(token),
+    });
+  }
 
   return fetch(targetUrl, { ...init, headers })
     .then(res => {
-      console.debug(`[API Response] ${res.status} ${res.statusText} from ${targetUrl}`, {
-        status: res.status,
-        ok: res.ok,
-        headers: headersToObject(res.headers),
-      });
+      if (import.meta.env.DEV) {
+        console.debug(`[API Response] ${res.status} ${res.statusText} from ${targetUrl}`, {
+          status: res.status,
+          ok: res.ok,
+          headers: headersToObject(res.headers),
+        });
+      }
       if (res.status === 401) {
-        console.warn(`[API Auth] 401 Unauthorized from ${path}. Clearing token.`);
+        if (import.meta.env.DEV) {
+          console.warn(`[API Auth] 401 Unauthorized from ${path}. Clearing token.`);
+        }
         handleUnauthorized();
       }
       return res;
     })
     .catch(err => {
-      console.error(`[API Error] Request failed for ${targetUrl}:`, err, {
-        origin: typeof window !== 'undefined' ? window.location.origin : undefined,
-        method,
-        serverBase,
-        path,
-      });
+      if (import.meta.env.DEV) {
+        console.error(`[API Error] Request failed for ${targetUrl}:`, err, {
+          origin: typeof window !== 'undefined' ? window.location.origin : undefined,
+          method,
+          serverBase,
+          path,
+        });
+      }
       throw err;
     });
 }
