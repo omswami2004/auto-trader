@@ -623,3 +623,33 @@ All paper trades compute Kotak Neo charges automatically:
 | STT (equity intraday) | 0.025% on SELL side only |
 | Stamp duty | 0.003% on BUY side only |
 | GST | 18% × (brokerage + SEBI + exchange fee) |
+
+---
+
+## Docker & Grafana Monitoring
+
+A complete containerized deployment and operations monitoring stack is provided via Docker Compose, Prometheus, Grafana, and Node Exporter.
+
+### Quick Start
+
+Launch the full containerized trading and telemetry stack:
+
+```bash
+docker compose up -d
+```
+
+Or run only telemetry services alongside a native host trading process:
+
+```bash
+docker compose up -d node-exporter prometheus grafana
+```
+
+### Access Points
+
+- **Grafana Dashboard**: [http://localhost:3000](http://localhost:3000) (User: `admin`, Password: `admin`)
+- **Prometheus UI**: [http://localhost:9090](http://localhost:9090)
+- **Node Exporter**: [http://localhost:9100](http://localhost:9100)
+- **Auto-Trader Server**: [http://localhost:8080](http://localhost:8080)
+
+See [monitoring/README.md](monitoring/README.md) for full configuration details.
+
