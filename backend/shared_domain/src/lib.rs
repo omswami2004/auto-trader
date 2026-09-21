@@ -33,6 +33,12 @@ pub const MARKET_OPEN_MINUTE: u32 = 15;
 pub const MARKET_CLOSE_HOUR: u32 = 15;
 pub const MARKET_CLOSE_MINUTE: u32 = 40;
 
+/// Cutoff for the automatic options expiry-day square-off: 15:38 IST, two
+/// minutes ahead of the 15:40 market close. This account trades options
+/// only, so nothing is ever meant to be carried into expiry/settlement.
+pub const EXPIRY_SQUAREOFF_HOUR: u32 = 15;
+pub const EXPIRY_SQUAREOFF_MINUTE: u32 = 38;
+
 pub fn is_market_open() -> bool {
     use chrono::Timelike;
     use chrono::Datelike;
@@ -188,6 +194,17 @@ pub struct TradingConfig {
     /// on every open `Target1Hit` dynamic-targeting position.
     #[serde(default = "default_extension_factor")]
     pub dynamic_targeting_extension_factor: f64,
+    /// Extends `dynamic_targeting` to one-lot positions. Normally a position
+    /// holding one lot (or less) has nothing left to run after target 1 sells
+    /// its only lot, so it exits in full (`TGT1_FULL`). With this on, target 1
+    /// sells **nothing** — the whole lot becomes the runner, with its stop
+    /// trailed and next rung extended exactly as for a multi-lot runner. The
+    /// trailed stop still never sits below entry (trail factor is clamped to
+    /// `[0, 1]`). Multi-lot positions are unaffected. Unused unless
+    /// `dynamic_targeting` is on; LIVE only, like the rest of dynamic
+    /// targeting. Off by default.
+    #[serde(default)]
+    pub dynamic_targeting_single_lot: bool,
     /// When enabled, protect gains **before** target 1: track the peak LTP
     /// since entry and, once the peak has covered `pre_t1_trail_arm_pct` % of
     /// the entry→target-1 distance, ratchet `current_sl` up to
@@ -351,6 +368,17 @@ pub struct MonitoredPosition {
     pub override_qty: Option<i32>,
     /// The precise Kotak OrderRequest mapped from the Scrip Master.
     pub resolved_order: Option<OrderRequest>,
+    /// The resolved contract's actual expiry date, from the Scrip Master
+    /// record `resolved_order` was built from. Distinct from
+    /// `signal.expiry`, which is the raw *parsed* string and is `None`
+    /// whenever the incoming message never stated one (`resolve_signal`
+    /// then falls back to the nearest upcoming expiry) — this is what that
+    /// resolution actually landed on, and what the expiry-day square-off
+    /// checks against. `None` until resolved, e.g. a position adopted from
+    /// the broker without a Scrip Master lookup — such a position never
+    /// gets an automatic expiry square-off.
+    #[serde(default)]
+    pub resolved_expiry: Option<NaiveDate>,
     /// Live Last Traded Price populated just before returning via API
     #[serde(default)]
     pub ltp: Option<f64>,
@@ -755,6 +783,22 @@ pub enum DbWriteMessage {
     },
     PositionsSnapshot {
         json: String,
+    },
+    /// One minute's aggregated option-chain OI for an index over a strike
+    /// window (analytics only — sourced from Upstox, never used for orders).
+    OiSnapshot {
+        ts: String,
+        underlying: String,
+        expiry: String,
+        /// Strikes each side of ATM included; 0 = the whole chain.
+        strike_window: i64,
+        call_oi: f64,
+        put_oi: f64,
+        call_oi_chg: f64,
+        put_oi_chg: f64,
+        spot: f64,
+        fut_ltp: Option<f64>,
+        fut_vwap: Option<f64>,
     },
 }
 

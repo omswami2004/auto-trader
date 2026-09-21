@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: "node-exporter"
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  - job_name: "auto-trader"
+    metrics_path: "/api/health"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["trader:8080"]
